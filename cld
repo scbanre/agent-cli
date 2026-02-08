@@ -1,0 +1,308 @@
+#!/bin/zsh
+# ------------------------------------------------------------------------------
+# Zsh Autoload Function: cld (Proxy Version)
+# 说明：专为 cliProxyAPI 设计的 Claude Code 启动脚本
+# 用法：通过 deploy_cld.sh 部署到 fpath 或直接执行
+# ------------------------------------------------------------------------------
+
+_die() { echo "❌ $1"; }
+
+# 依赖检查
+command -v claude >/dev/null 2>&1 || { _die "未找到 claude 命令"; return 1; }
+command -v fzf    >/dev/null 2>&1 || { _die "未安装 fzf"; return 1; }
+
+# ================= 配置 =================
+local PROXY_BASE="http://127.0.0.1:8145"
+local PROXY_KEY="dummy-key"  # 网关鉴权主要靠内部配置，这里传 dummy 即可
+
+local AG_BASE="${ANTI_API_BASE:-http://127.0.0.1:8045/v1}"
+local AG_KEY="${ANTI_API_TOKEN:-}"
+
+# AG 模型配置
+local AG_CODE_MODEL="${CLD_AG_CODE_MODEL:-claude-opus-4-5-thinking}"
+local AG_DOC_MODEL="${CLD_AG_DOC_MODEL:-gemini-3-pro-high}"
+local AG_FAST_MODEL="${CLD_AG_FAST_MODEL:-gemini-3-flash}"
+
+local CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cld"
+local UI_FZF_HEIGHT="40%"
+# ========================================
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "help" ]]; then
+  echo "Usage: cld [cp|ag] [model_filter] [args...]"
+  echo "  cp: Connect to cliProxyAPI (Load Balanced)"
+  echo "  ag: Connect to Antigravity directly (Debug)"
+  return 0
+fi
+
+_norm_base() { echo "${1%/}"; }
+_short_model() { local m="$1"; m="${m##*/}"; echo "${m%%-*}"; }
+
+_set_title() {
+  local t="$1"
+  if [[ -n "$TMUX" ]]; then
+    printf "\033Ptmux;\033\033]0;%s\007\033\\" "$t"
+  else
+    printf "\033]0;%s\007" "$t"
+  fi
+}
+
+# 获取可用模型列表
+# 优先从 CLD_TOML 环境变量指定的 TOML 文件读取，否则返回内置列表
+# 内置列表由 deploy_cld.sh 在部署时从 providers.toml 烘焙
+_get_proxy_models() {
+  # 如果指定了 TOML 文件，动态解析
+  local toml="${CLD_TOML:-}"
+  if [[ -n "$toml" && -f "$toml" ]]; then
+    local models
+    models=$(sed -n '/^\[routing\]/,/^\[.*\]/p' "$toml" | grep '^[[:space:]]*"' | cut -d'"' -f2)
+    if [[ -n "$models" ]]; then
+      echo "$models"
+      return
+    fi
+  fi
+
+  # --- BEGIN MODELS ---
+  echo "opus4.6"
+  echo "opus4.5"
+  echo "g3p"
+  echo "g3f"
+  echo "g3i"
+  echo "gpt5.3"
+  echo "gpt5.2"
+  # --- END MODELS ---
+}
+
+local mode=""
+# 1. 模式选择 (如果没有参数)
+if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "ag" || "${1:-}" == "official") ]]; then
+  mode="$1"
+  shift 1
+else
+  # 交互式选择模式
+  mode="$(printf "cp (Custom Proxy)\nag (Antigravity Direct)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
+  [[ -z "$mode" ]] && return 0
+fi
+
+mkdir -p "$CACHE_DIR/$mode" >/dev/null 2>&1 || true
+local -a envs=()
+
+# 清理代理和认证变量，防止模式间污染
+envs+=(
+  "HTTP_PROXY=" "HTTPS_PROXY=" "ALL_PROXY="
+  "ANTHROPIC_AUTH_TOKEN="
+)
+
+# 2. 模式逻辑
+local title=""
+case "$mode" in
+  cp)
+    echo "🚀 Mode: cliProxyAPI (Load Balanced)"
+    local cp_dir="$CACHE_DIR/cp"
+    mkdir -p "$cp_dir" >/dev/null 2>&1 || true
+
+    # 获取模型列表 (从 TOML 实时解析)
+    local avail_models="$(_get_proxy_models)"
+    [[ -z "$avail_models" ]] && _die "无法从 TOML 获取模型列表"
+
+    # 定义角色和默认记忆文件
+    local -A roles=(
+      [main]="ANTHROPIC_MODEL"
+      [fast]="ANTHROPIC_DEFAULT_HAIKU_MODEL"
+      [opus]="ANTHROPIC_DEFAULT_OPUS_MODEL"
+    )
+    local -A prompts=(
+      [main]="Select MAIN Model (Coding/Chat)"
+      [fast]="Select FAST Model (Search/Git)"
+      [opus]="Select OPUS Model (Reasoning/Plan)"
+    )
+    # 默认顺序
+    local -a steps=(main fast opus)
+
+    # 如果有参数，尝试作为 filter 快速启动 main 模型，其他复用上次记忆或默认
+    if [[ -n "${1:-}" && ! "${1:-}" =~ ^- ]]; then
+      local filter="$1"
+      local match=$(echo "$avail_models" | grep -i "$filter" | head -1)
+      if [[ -n "$match" ]]; then
+        echo "⚡️ Fast Start: Main=$match"
+        envs+=( "${roles[main]}=$match" )
+        # 其他角色尝试读取记忆，没有则跟随 Main
+        for role in fast opus; do
+          local last_file="$cp_dir/last_$role"
+          if [[ -f "$last_file" ]]; then
+            envs+=( "${roles[$role]}=$(cat "$last_file")" )
+          else
+            envs+=( "${roles[$role]}=$match" )
+          fi
+        done
+        # 特殊处理: 子 Agent
+        envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$(cat "$cp_dir/last_fast" 2>/dev/null || echo "$match")" )
+        shift 1
+
+        # 注入其他基础变量
+        envs+=(
+          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
+          "ANTHROPIC_API_KEY=$PROXY_KEY"
+          "CLAUDE_CONFIG_DIR=$cp_dir"
+        )
+        # 跳过交互
+        goto_exec=true
+      fi
+    fi
+
+    # ── 场景预设选择 ──
+    if [[ "$goto_exec" != "true" ]]; then
+      local -A scenario_main=( [Performance]=opus4.6  [Balanced]=opus4.6  [Economy]=g3p )
+      local -A scenario_fast=( [Performance]=g3f      [Balanced]=g3f      [Economy]=g3f )
+      local -A scenario_opus=( [Performance]=opus4.6  [Balanced]=g3p      [Economy]=g3p )
+      local -a scenario_names=( Performance Balanced Economy Custom )
+
+      local last_scenario_file="$cp_dir/last_scenario"
+      local last_scenario=""
+      [[ -f "$last_scenario_file" ]] && last_scenario="$(cat "$last_scenario_file")"
+
+      # 构建 fzf 列表，上次选择置顶
+      local scenario_list=""
+      if [[ -n "$last_scenario" ]]; then
+        scenario_list="$last_scenario"$'\n'
+        for s in "${scenario_names[@]}"; do
+          [[ "$s" != "$last_scenario" ]] && scenario_list+="$s"$'\n'
+        done
+      else
+        for s in "${scenario_names[@]}"; do
+          scenario_list+="$s"$'\n'
+        done
+      fi
+
+      local scenario_prompt="Select Scenario> "
+      [[ -n "$last_scenario" ]] && scenario_prompt="Select Scenario (Last: $last_scenario)> "
+
+      local chosen_scenario
+      chosen_scenario=$(echo "$scenario_list" | sed '/^$/d' | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Scenario" --prompt="$scenario_prompt")
+
+      if [[ -z "$chosen_scenario" ]]; then
+        # ESC: 复用上次场景，上次也无则退出
+        if [[ -n "$last_scenario" ]]; then
+          chosen_scenario="$last_scenario"
+          echo "   Using last scenario: $chosen_scenario"
+        else
+          return 0
+        fi
+      fi
+
+      echo "$chosen_scenario" > "$last_scenario_file"
+
+      if [[ "$chosen_scenario" != "Custom" ]]; then
+        local s_main="${scenario_main[$chosen_scenario]}"
+        local s_fast="${scenario_fast[$chosen_scenario]}"
+        local s_opus="${scenario_opus[$chosen_scenario]}"
+        echo "📦 Scenario: $chosen_scenario → Main=$s_main  Fast=$s_fast  Opus=$s_opus"
+
+        envs+=( "${roles[main]}=$s_main" "${roles[fast]}=$s_fast" "${roles[opus]}=$s_opus" )
+        envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$s_fast" )
+
+        # 同步更新角色记忆
+        echo "$s_main" > "$cp_dir/last_main"
+        echo "$s_fast" > "$cp_dir/last_fast"
+        echo "$s_opus" > "$cp_dir/last_opus"
+
+        envs+=(
+          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
+          "ANTHROPIC_API_KEY=$PROXY_KEY"
+          "CLAUDE_CONFIG_DIR=$cp_dir"
+        )
+        goto_exec=true
+      fi
+    fi
+
+    if [[ "$goto_exec" != "true" ]]; then
+      # 交互式选择 3 个模型 (Custom 场景)
+      for role in "${steps[@]}"; do
+        local last_file="$cp_dir/last_$role"
+        local last_val=""
+        [[ -f "$last_file" ]] && last_val="$(cat "$last_file")"
+
+        local fzf_prompt="${prompts[$role]}> "
+        [[ -n "$last_val" ]] && fzf_prompt="${prompts[$role]} (Last: $last_val)> "
+
+        # 构建列表
+        local fzf_input=""
+        if [[ -n "$last_val" ]]; then
+           if echo "$avail_models" | grep -q "^${last_val}$"; then
+             fzf_input+="$last_val"$'\n'
+             fzf_input+=$(echo "$avail_models" | grep -v "^${last_val}$")
+           else
+             fzf_input="$avail_models"
+           fi
+        else
+           fzf_input="$avail_models"
+        fi
+
+        local sel
+        sel=$(echo "$fzf_input" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="${prompts[$role]}" --prompt="$fzf_prompt")
+
+        # 如果取消选择，尝试用上次的值，如果还没值则退出
+        if [[ -z "$sel" ]]; then
+          if [[ -n "$last_val" ]]; then
+            sel="$last_val"
+            echo "   Using last: $sel"
+          else
+            return 0
+          fi
+        fi
+
+        # 保存记忆
+        echo "$sel" > "$last_file"
+        envs+=( "${roles[$role]}=$sel" )
+      done
+
+      # 补充 Subagent (跟随 Fast)
+      envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$(cat "$cp_dir/last_fast")" )
+
+      # 注入基础变量
+      envs+=(
+        "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
+        "ANTHROPIC_API_KEY=$PROXY_KEY"
+        "CLAUDE_CONFIG_DIR=$cp_dir"
+      )
+    fi
+
+    # 提取 Main 模型名用于标题
+    local main_model="${envs[(r)ANTHROPIC_MODEL=*]}"
+    main_model="${main_model#*=}"
+    title="cld:cp:$(_short_model "$main_model")"
+    ;;
+
+  ag)
+    [[ -z "$AG_KEY" ]] && { _die "Missing ANTI_API_TOKEN"; return 1; }
+    echo "🚀 Mode: Antigravity Direct"
+    mkdir -p "$CACHE_DIR/ag" >/dev/null 2>&1 || true
+
+    envs+=(
+      "ANTHROPIC_BASE_URL=$(_norm_base "$AG_BASE")"
+      "ANTHROPIC_API_KEY=$AG_KEY"
+      "ANTHROPIC_MODEL=$AG_CODE_MODEL"
+      "ANTHROPIC_DEFAULT_SONNET_MODEL=$AG_CODE_MODEL"
+      "ANTHROPIC_DEFAULT_OPUS_MODEL=$AG_DOC_MODEL"
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL=$AG_FAST_MODEL"
+      "CLAUDE_CODE_SUBAGENT_MODEL=haiku"
+      "CLAUDE_CONFIG_DIR=$CACHE_DIR/ag"
+    )
+    title="cld:ag:${AG_CODE_MODEL}"
+    echo "   Code=$AG_CODE_MODEL"
+    echo "   Doc =$AG_DOC_MODEL"
+    echo "   Fast=$AG_FAST_MODEL"
+    ;;
+
+  official)
+    echo "🚀 Mode: Official (Anthropic)"
+    # 使用系统默认配置 (~/.claude/config.json)
+    # 不注入任何 BASE_URL 或 KEY，仅设置标题
+    envs+=( "CLAUDE_CONFIG_DIR=" )
+    title="cld:off"
+    ;;
+esac
+
+_set_title "$title"
+
+# 执行 Claude，并透传剩余参数
+env "${envs[@]}" claude "$@"

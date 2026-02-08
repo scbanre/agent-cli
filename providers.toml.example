@@ -1,0 +1,70 @@
+# cliProxyAPI 聚合网关配置 (物理实例 + 逻辑路由)
+
+[global]
+host = "0.0.0.0"
+main_port = 8145                 # 主聚合端口
+proxy = ""                       # 可选：http://127.0.0.1:7890
+
+# ==========================================
+# 1. 物理实例定义 (Instances)
+#    每个 [instances.name] 对应一个独立进程
+# ==========================================
+
+# --- 实例 A: Official (官方原生 Auth 聚合) ---
+# 包含 Antigravity (Google) 和 OpenAI (Codex/ChatGPT)
+# 均使用 OAuth 登录，无需在此填 Key
+[instances.official]
+port = 8146
+providers = [
+  # 1. Antigravity (Google OAuth)
+  # 需运行: ./cliproxy --antigravity-login
+  { type = "antigravity", rotation_strategy = "round-robin" },
+
+  # 2. OpenAI Official (Codex/ChatGPT OAuth)
+  # 需运行: ./cliproxy --codex-login
+  { type = "codex", rotation_strategy = "round-robin" },
+]
+
+# --- 实例 B: Relay (第三方中继 - API Key) ---
+[instances.relay]
+port = 8147
+providers = [
+  # Endpoint 1: OpenAI 兼容 (GPT, DeepSeek, Kimi)
+  { type = "openai", base_url = "https://your-relay.com/v1", api_keys = [
+    "${RELAY_KEY}",
+  ] },
+  # Endpoint 2: Anthropic 兼容 (Claude)
+  { type = "anthropic", base_url = "https://your-relay.com/anthropic", api_keys = [
+    "${RELAY_KEY}",
+  ] },
+  # Endpoint 3: Vertex AI 兼容 (Gemini)
+  { type = "gemini", base_url = "https://your-relay.com/vertex-ai", api_keys = [
+    "${RELAY_KEY}",
+  ] },
+]
+
+# ==========================================
+# 2. 聚合路由与映射 (Routing)
+#    定义主网关对外暴露的模型，以及分发策略
+#    格式: "对外ID" = [ { instance="实例名", provider="逻辑Provider类型", model="内部映射名", weight=权重 }, ... ]
+# ==========================================
+
+[routing]
+
+# --- Claude (权重示例) ---
+"opus4.5" = [
+  { instance = "official", provider = "antigravity", model = "claude-opus-4-5-thinking", weight = 80 },
+  { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.5", weight = 20 },
+]
+
+# --- Gemini ---
+"gemini-pro" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
+  { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high" } },
+]
+
+# --- GPT ---
+"gpt5" = [
+  { instance = "official", provider = "codex", model = "gpt-5.2", weight = 80, params = { "reasoning_effort" = "high" } },
+  { instance = "relay", provider = "openai", model = "openai/gpt-5.2", weight = 20, params = { "reasoning_effort" = "high" } },
+]

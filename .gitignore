@@ -1,0 +1,17 @@
+# Secrets
+.env
+antigravity-*.json
+codex-*.json
+
+# Generated
+instances/*.yaml
+!instances/.gitkeep
+logs/*
+!logs/.gitkeep
+node_modules/
+cliproxy
+ecosystem.config.js
+lb.js
+
+# OS
+.DS_Store
