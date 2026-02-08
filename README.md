@@ -14,8 +14,8 @@
 |------|------|
 | `providers.toml` | 主配置：实例定义 + 路由规则 |
 | `generate_config.py` | 配置生成器：TOML → YAML + LB + PM2 |
-| `lb.js` | Node.js 负载均衡器 |
 | `cld` | CLI 启动脚本（FZF 选模型） |
+| `deploy_cld.sh` | 部署 cld 到 zsh fpath |
 | `source_code/` | 核心代理 (git submodule) |
 
 ## 快速开始
@@ -45,6 +45,9 @@ python3 generate_config.py
 
 # 7. 启动
 pm2 start ecosystem.config.js
+
+# 8. 部署 cld 到 zsh fpath (可选)
+./deploy_cld.sh
 ```
 
 ## 常用命令
@@ -75,9 +78,8 @@ agent-cli/
 ├── providers.toml.example  # 配置模板
 ├── .env.example            # 密钥模板
 ├── generate_config.py      # 配置生成器
-├── lb.js                   # 负载均衡器
 ├── cld                     # CLI 启动脚本
-├── ecosystem.config.js     # PM2 配置
+├── deploy_cld.sh           # 部署脚本
 ├── docs/                   # 文档
 ├── scripts/                # 辅助脚本
 ├── instances/              # 生成的实例配置 (gitignore)
