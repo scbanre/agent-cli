@@ -1,5 +1,7 @@
 # providers.toml 配置说明
 
+`providers.toml` 是本仓库的统一编排入口：它不替代 `cliproxyapi` 的核心代理能力，而是把多实例路由、LB 与 PM2 运行配置收敛到一份声明式配置中。
+
 ## 1. 全局配置
 
 ```toml

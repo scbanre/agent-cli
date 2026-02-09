@@ -8,6 +8,30 @@
 客户端请求 → LB (8145) → 物理实例 (8146/8147) → 上游 API
 ```
 
+## 这个项目有什么用
+
+这个仓库是 `cliproxyapi` 的网关编排层，用来把多个后端实例统一成一个稳定入口，适合以下场景：
+
+- 一个入口承接多种模型/账号，不让客户端感知后端差异
+- 按模型名做路由，并用权重控制流量分配
+- 在 OAuth 实例与 API Key 实例之间做混合调度
+- 降低多实例部署和变更成本（改一份 TOML，自动生成运行配置）
+
+## 相比 cliproxyapi 补充了什么
+
+`source_code/` 提供的是核心代理能力；本仓库补充的是“多实例编排 + 运维自动化”：
+
+| 维度 | cliproxyapi（核心） | 本仓库（补充） |
+|------|---------------------|----------------|
+| 角色 | 单实例代理与协议转换 | 多实例聚合网关 |
+| 配置入口 | 各实例独立 YAML/配置 | 单一 `providers.toml` 统一定义 |
+| 路由能力 | 实例内 provider/account 轮询 | 基于 `model` 的跨实例加权路由 |
+| 运行编排 | 需手动组织进程与端口 | 自动生成 `lb.js` + `ecosystem.config.js` + `instances/*.yaml` |
+| 客户端接入 | 直连单实例端口 | 统一从 LB 端口接入（默认 8145） |
+| 工具链 | 核心二进制 | 额外提供 `generate_config.py`、`cld`、`deploy_cld.sh` |
+
+边界说明：本仓库不替代 `cliproxyapi` 核心功能，而是作为其上层的部署与路由控制面。
+
 ## 核心文件
 
 | 文件 | 说明 |
@@ -17,6 +41,34 @@
 | `cld` | CLI 启动脚本（FZF 选模型） |
 | `deploy_cld.sh` | 部署 cld 到 zsh fpath |
 | `source_code/` | 核心代理 (git submodule) |
+
+## cld 脚本说明
+
+`cld` 是面向 Claude Code 的启动封装，目标是用最少命令在不同后端模式间切换，并把模型选择映射到环境变量。
+
+### 支持模式
+
+- `cp`: 通过本项目 LB（默认 `http://127.0.0.1:8145`）接入，支持场景预设和模型记忆
+- `ag`: 直连 Antigravity（调试用），依赖 `ANTI_API_TOKEN`
+- `official`: 走 Anthropic 官方默认配置（不注入 `BASE_URL` / `API_KEY`）
+
+### 常用用法
+
+```bash
+cld                    # 交互选择模式 + 模型
+cld cp                 # 直连网关模式
+cld cp opus            # 按关键字快速匹配主模型并启动
+cld ag                 # 直连 Antigravity
+cld official           # 官方模式
+```
+
+### 行为要点
+
+- `cp` 模式优先从 `CLD_TOML` 指定的 `providers.toml` 读取 `[routing]` 模型列表；读不到时使用内置模型列表
+- `cp` 模式会分别设置 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL`
+- `cp` 模式会把最近一次选择缓存到 `~/.cache/cld/cp/last_*`，下次可复用
+- 子 Agent 模型通过 `CLAUDE_CODE_SUBAGENT_MODEL` 跟随 fast 角色
+- `ag` 模式可用 `CLD_AG_CODE_MODEL` / `CLD_AG_DOC_MODEL` / `CLD_AG_FAST_MODEL` 覆盖默认模型
 
 ## 快速开始
 
