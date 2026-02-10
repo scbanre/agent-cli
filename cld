@@ -63,7 +63,6 @@ _get_proxy_models() {
 
   # --- BEGIN MODELS ---
   echo "opus4.6"
-  echo "opus4.5"
   echo "g3p"
   echo "g3f"
   echo "g3i"
