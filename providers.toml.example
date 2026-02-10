@@ -60,7 +60,7 @@ providers = [
 # --- Gemini ---
 "gemini-pro" = [
   { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
-  { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "medium" } },
+  { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high" } },
 ]
 
 # --- GPT ---
