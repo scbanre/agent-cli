@@ -130,6 +130,7 @@ pm2 logs                     # 查看日志
 ## 详细文档
 
 - `providers.toml` 语法：[docs/agent/shared/providers-toml.md](docs/agent/shared/providers-toml.md)
+- 开发记录（上游对齐）：[docs/agent/shared/development-notes.md](docs/agent/shared/development-notes.md)
 - 核心代理文档：[source_code/README.md](source_code/README.md)
 
 ## 目录结构
