@@ -40,8 +40,36 @@ providers = [
 
 - `weight`: 权重越大，命中概率越高
 - `provider`: 必须匹配实例中定义的 provider type，否则报 `unknown provider for model ...`
+- `params`: 可选，按路由目标注入请求参数（由 `generate_config.py` 生成的 `lb.js` 在转发时应用）
 
-## 端口分配
+## 4. 路由 params（可选）
+
+常见可用参数：
+
+- `reasoning_effort`: 例如 `low` / `medium` / `high`
+- `thinking_budget_max`: 限制 `thinking.budget_tokens` 的上限，避免后端把过大预算映射到不支持的等级
+- `anthropic_beta`: 追加到 `anthropic-beta` 请求头（会与客户端已有值去重合并）
+- `extra_headers`: 注入额外请求头（键名不区分大小写；会忽略 `content-length` / `host`）
+
+Gemini 3 Pro relay 推荐写法：
+
+```toml
+"gemini-pro" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
+  { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 } },
+]
+```
+
+Claude 1M 上下文（可选，默认不加）示例：
+
+```toml
+"opus4.6" = [
+  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+  { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+]
+```
+
+## 5. 端口分配
 
 | 端口 | 服务 |
 |------|------|
@@ -49,7 +77,7 @@ providers = [
 | 8146 | official 实例 (OAuth) |
 | 8147 | zenmux 实例 (API Key) |
 
-## 生成文件 (gitignore)
+## 6. 生成文件 (gitignore)
 
 | 文件 | 说明 |
 |------|------|
@@ -58,7 +86,7 @@ providers = [
 | `ecosystem.config.js` | PM2 进程配置 |
 | `cliproxy` | 编译的二进制文件 |
 
-## cld 模型 Tier 映射
+## 7. cld 模型 Tier 映射
 
 `cld` 脚本通过环境变量预设模型映射，Claude Code 的 Task 工具通过 `model` 参数选择 tier，实际请求经 cliproxyapi 路由到对应后端。
 

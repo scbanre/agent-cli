@@ -57,6 +57,13 @@ providers = [
   { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.5", weight = 20 },
 ]
 
+# 可选（默认可不加）：若上游已开通 1M context，可在 Claude 路由追加 anthropic beta 头
+# 示例：
+# "opus4.6" = [
+#   { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+#   { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+# ]
+
 # --- Gemini ---
 "gemini-pro" = [
   { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },

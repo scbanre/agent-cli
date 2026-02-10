@@ -118,6 +118,15 @@ pm2 logs                     # 查看日志
 
 **添加新后端**: 在 `[instances.xxx]` 新增实例 → 在 `[routing]` 引用 → 生成配置并重启
 
+### 路由参数注意事项
+
+- `lb.js` 是由 `generate_config.py` 自动生成的产物，不要手改（会在下次生成时被覆盖）
+- 当 Gemini 3 Pro 走 relay（如 `google/gemini-3-pro-preview`）时，建议配置：
+  - `params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 }`
+- 该上限用于约束过大的 `thinking.budget_tokens`，避免被后端映射为不支持的 `xhigh` 并返回 400
+- Claude 1M context 建议通过路由 `params.anthropic_beta` 配置（可选，默认不加）
+- 如需注入其他请求头，可使用 `params.extra_headers`（按路由目标生效）
+
 ## 详细文档
 
 - `providers.toml` 语法：[docs/agent/shared/providers-toml.md](docs/agent/shared/providers-toml.md)
