@@ -19,7 +19,7 @@ local AG_BASE="${ANTI_API_BASE:-http://127.0.0.1:8045/v1}"
 local AG_KEY="${ANTI_API_TOKEN:-}"
 
 # AG 模型配置
-local AG_CODE_MODEL="${CLD_AG_CODE_MODEL:-claude-opus-4-5-thinking}"
+local AG_CODE_MODEL="${CLD_AG_CODE_MODEL:-claude-opus-4-6-thinking}"
 local AG_DOC_MODEL="${CLD_AG_DOC_MODEL:-gemini-3-pro-high}"
 local AG_FAST_MODEL="${CLD_AG_FAST_MODEL:-gemini-3-flash}"
 
