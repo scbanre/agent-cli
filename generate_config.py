@@ -626,7 +626,8 @@ function getRouteCandidates(route, model) {{
     return {{ targets, weights, cooledOut: false }};
 }}
 
-function getStickyTarget(route, key, model) {{
+function getStickyTarget(route, key, model, options = {{}}) {{
+    const ignoreCooldown = options.ignoreCooldown === true;
     const entry = stickyRoutes.get(key);
     if (!entry) return null;
     if (entry.expiresAt <= Date.now()) {{
@@ -642,7 +643,7 @@ function getStickyTarget(route, key, model) {{
         stickyRoutes.delete(key);
         return null;
     }}
-    if (isTargetCooling(model, matched)) {{
+    if (!ignoreCooldown && isTargetCooling(model, matched)) {{
         stickyRoutes.delete(key);
         return null;
     }}
@@ -711,28 +712,40 @@ const server = http.createServer((req, res) => {{
             let selected = null;
             let routingDecision = 'weighted_random';
 
-            if (sessionKey) {{
-                const key = stickyRouteKey(sessionKey, model);
-                req._stickyKey = key;
-                selected = getStickyTarget(route, key, model);
-                if (selected) {{
-                    routingDecision = 'sticky_session_model';
-                }} else {{
-                    const candidates = getRouteCandidates(route, model);
-                    if (req._hasThinkingSignature && candidates.targets.length > 1) {{
-                        selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
-                        routingDecision = 'thinking_primary_fallback';
+            const allWeights = Array.isArray(route.weights)
+                ? route.weights
+                : route.targets.map(() => 1);
+
+            if (req._hasThinkingSignature) {{
+                if (sessionKey) {{
+                    const key = stickyRouteKey(sessionKey, model);
+                    req._stickyKey = key;
+                    // Thinking 会话必须保持同链路，避免 signature 跨后端失效。
+                    selected = getStickyTarget(route, key, model, {{ ignoreCooldown: true }});
+                    if (selected) {{
+                        routingDecision = 'sticky_session_model_thinking_locked';
                     }} else {{
+                        selected = selectHighestWeightTarget(route.targets, allWeights);
+                        routingDecision = 'thinking_primary_locked';
+                    }}
+                }} else {{
+                    selected = selectHighestWeightTarget(route.targets, allWeights);
+                    routingDecision = 'thinking_primary_locked_no_session';
+                }}
+            }} else {{
+                if (sessionKey) {{
+                    const key = stickyRouteKey(sessionKey, model);
+                    req._stickyKey = key;
+                    selected = getStickyTarget(route, key, model);
+                    if (selected) {{
+                        routingDecision = 'sticky_session_model';
+                    }} else {{
+                        const candidates = getRouteCandidates(route, model);
                         selected = weightedRandom(candidates.targets, candidates.weights);
                         routingDecision = candidates.cooledOut ? 'weighted_random_all_targets_in_cooldown' : 'weighted_random';
                     }}
-                }}
-            }} else {{
-                const candidates = getRouteCandidates(route, model);
-                if (req._hasThinkingSignature && candidates.targets.length > 1) {{
-                    selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
-                    routingDecision = 'thinking_primary_fallback_no_session';
                 }} else {{
+                    const candidates = getRouteCandidates(route, model);
                     selected = weightedRandom(candidates.targets, candidates.weights);
                     routingDecision = candidates.cooledOut ? 'weighted_random_no_session_all_targets_in_cooldown' : 'weighted_random';
                 }}
