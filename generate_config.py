@@ -209,7 +209,13 @@ const RESPONSE_PREVIEW_LIMIT = LOG_VERBOSE ? 2000 : 500;
 const STICKY_ROUTE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const STICKY_CLEANUP_MS = 10 * 60 * 1000;
 const MAX_STICKY_KEYS = 500;
+const TARGET_COOLDOWN_CLEANUP_MS = 10 * 1000;
+const AUTH_COOLDOWN_MS = 5 * 60 * 1000;
+const TRANSIENT_COOLDOWN_MS = 60 * 1000;
+const TRANSIENT_HEAVY_COOLDOWN_MS = 2 * 60 * 1000;
+const SIGNATURE_COOLDOWN_MS = 2 * 60 * 1000;
 const stickyRoutes = new Map();
+const targetCooldowns = new Map();
 
 // 确保日志目录存在
 if (!fs.existsSync(LOG_DIR)) {{
@@ -259,6 +265,12 @@ setInterval(() => {{
         if (value.expiresAt <= now) stickyRoutes.delete(key);
     }}
 }}, STICKY_CLEANUP_MS);
+setInterval(() => {{
+    const now = Date.now();
+    for (const [key, value] of targetCooldowns.entries()) {{
+        if (value.expiresAt <= now) targetCooldowns.delete(key);
+    }}
+}}, TARGET_COOLDOWN_CLEANUP_MS);
 
 // 从 SSE 流中提取 usage 信息
 function extractUsageFromSSE(chunks) {{
@@ -285,6 +297,72 @@ function extractUsageFromJSON(body) {{
     }} catch (e) {{
         return null;
     }}
+}}
+
+function parseErrorSummary(contentType, body) {{
+    const segments = [];
+    if (contentType.includes('application/json')) {{
+        try {{
+            const payload = JSON.parse(body);
+            const err = payload?.error ?? payload;
+            if (typeof err === 'string') {{
+                segments.push(err);
+            }} else if (err && typeof err === 'object') {{
+                const fields = ['message', 'code', 'type', 'status', 'reason'];
+                for (const field of fields) {{
+                    if (typeof err[field] === 'string') segments.push(err[field]);
+                }}
+                if (Array.isArray(err.details)) {{
+                    for (const detail of err.details) {{
+                        if (detail && typeof detail.reason === 'string') segments.push(detail.reason);
+                        if (typeof detail?.domain === 'string') segments.push(detail.domain);
+                    }}
+                }}
+            }}
+        }} catch (e) {{}}
+    }}
+    if (segments.length === 0 && typeof body === 'string' && body.length > 0) {{
+        segments.push(body.slice(0, RESPONSE_PREVIEW_LIMIT));
+    }}
+    return segments.join(' ').toLowerCase();
+}}
+
+function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {{
+    if (statusCode >= 200 && statusCode < 300) {{
+        return {{ kind: 'success', clearSticky: false, cooldownMs: 0 }};
+    }}
+
+    const summary = parseErrorSummary(contentType, body);
+    const isAuthError = summary.includes('auth_unavailable') ||
+        summary.includes('auth_not_found') ||
+        statusCode === 401 || statusCode === 403;
+    if (isAuthError) {{
+        return {{ kind: 'auth', clearSticky: true, cooldownMs: AUTH_COOLDOWN_MS }};
+    }}
+
+    const isSignatureError = hasThinkingSignature &&
+        summary.includes('signature') &&
+        (statusCode === 400 || statusCode === 422 || statusCode === 500);
+    if (isSignatureError) {{
+        return {{ kind: 'signature', clearSticky: true, cooldownMs: SIGNATURE_COOLDOWN_MS }};
+    }}
+
+    if ([408, 429, 500, 502, 503, 504].includes(statusCode)) {{
+        const cooldownMs = (statusCode === 429 || statusCode === 503)
+            ? TRANSIENT_HEAVY_COOLDOWN_MS
+            : TRANSIENT_COOLDOWN_MS;
+        return {{ kind: 'transient', clearSticky: true, cooldownMs }};
+    }}
+
+    if (statusCode === 400 || statusCode === 422) {{
+        return {{ kind: 'client', clearSticky: false, cooldownMs: 0 }};
+    }}
+
+    return {{
+        kind: 'other',
+        clearSticky: statusCode >= 500,
+        cooldownMs: statusCode >= 500 ? TRANSIENT_COOLDOWN_MS : 0
+    }};
 }}
 
 function maskSecret(value) {{
@@ -374,6 +452,32 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
         // 提取 token 使用信息
         let usage = null;
         const contentType = proxyRes.headers['content-type'] || '';
+        const routeAction = classifyResponse(
+            proxyRes.statusCode || 0,
+            contentType,
+            responseBody,
+            req._hasThinkingSignature || false
+        );
+        req._routeAction = routeAction.kind;
+        req._cooldownMsApplied = 0;
+        req._stickyAction = 'none';
+
+        if (req._stickyKey) {{
+            if (routeAction.kind === 'success') {{
+                if (req._selectedTarget) {{
+                    setStickyTarget(req._stickyKey, req._selectedTarget);
+                    req._stickyAction = 'set_on_success';
+                }}
+            }} else if (routeAction.clearSticky) {{
+                clearStickyTarget(req._stickyKey);
+                req._stickyAction = 'clear_on_error';
+            }}
+        }}
+        if (routeAction.cooldownMs > 0 && req._selectedTarget && req._model) {{
+            setTargetCooldown(req._model, req._selectedTarget, routeAction.cooldownMs);
+            req._cooldownMsApplied = routeAction.cooldownMs;
+        }}
+
         if (contentType.includes('text/event-stream')) {{
             usage = extractUsageFromSSE(responseBody);
         }} else if (contentType.includes('application/json')) {{
@@ -398,7 +502,8 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
                 provider: req._targetProvider || null,
                 decision: req._routingDecision || null,
                 session_key_hash: req._sessionKeyHash || null,
-                has_thinking_signature: req._hasThinkingSignature || false
+                has_thinking_signature: req._hasThinkingSignature || false,
+                sticky_action: req._stickyAction || 'none'
             }},
             response: {{
                 status_code: proxyRes.statusCode,
@@ -406,7 +511,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
                 body_length: responseBody.length,
                 body_preview: responseBody.length > RESPONSE_PREVIEW_LIMIT
                     ? responseBody.slice(0, RESPONSE_PREVIEW_LIMIT) + '...[truncated]'
-                    : responseBody
+                    : responseBody,
+                route_action: req._routeAction || null,
+                cooldown_ms_applied: req._cooldownMsApplied || 0
             }},
             usage: usage
         }};
@@ -472,7 +579,54 @@ function stickyRouteKey(sessionKey, model) {{
     return `${{sessionKey}}::${{model}}`;
 }}
 
-function getStickyTarget(route, key) {{
+function targetCooldownKey(model, target) {{
+    return `${{model}}::${{target.instance}}::${{target.target}}::${{target.rewrite}}`;
+}}
+
+function clearStickyTarget(key) {{
+    if (!key) return;
+    stickyRoutes.delete(key);
+}}
+
+function setTargetCooldown(model, target, cooldownMs) {{
+    if (!model || !target || cooldownMs <= 0) return;
+    targetCooldowns.set(targetCooldownKey(model, target), {{
+        expiresAt: Date.now() + cooldownMs
+    }});
+}}
+
+function isTargetCooling(model, target) {{
+    const key = targetCooldownKey(model, target);
+    const entry = targetCooldowns.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt <= Date.now()) {{
+        targetCooldowns.delete(key);
+        return false;
+    }}
+    return true;
+}}
+
+function getRouteCandidates(route, model) {{
+    const routeWeights = Array.isArray(route.weights) ? route.weights : [];
+    const targets = [];
+    const weights = [];
+    for (let i = 0; i < route.targets.length; i++) {{
+        const target = route.targets[i];
+        if (isTargetCooling(model, target)) continue;
+        targets.push(target);
+        weights.push(routeWeights[i] || 1);
+    }}
+    if (targets.length === 0) {{
+        return {{
+            targets: route.targets,
+            weights: route.targets.map((_, idx) => routeWeights[idx] || 1),
+            cooledOut: true
+        }};
+    }}
+    return {{ targets, weights, cooledOut: false }};
+}}
+
+function getStickyTarget(route, key, model) {{
     const entry = stickyRoutes.get(key);
     if (!entry) return null;
     if (entry.expiresAt <= Date.now()) {{
@@ -485,6 +639,10 @@ function getStickyTarget(route, key) {{
         target.rewrite === entry.rewrite
     );
     if (!matched) {{
+        stickyRoutes.delete(key);
+        return null;
+    }}
+    if (isTargetCooling(model, matched)) {{
         stickyRoutes.delete(key);
         return null;
     }}
@@ -555,25 +713,39 @@ const server = http.createServer((req, res) => {{
 
             if (sessionKey) {{
                 const key = stickyRouteKey(sessionKey, model);
-                selected = getStickyTarget(route, key);
+                req._stickyKey = key;
+                selected = getStickyTarget(route, key, model);
                 if (selected) {{
                     routingDecision = 'sticky_session_model';
                 }} else {{
-                    if (req._hasThinkingSignature && route.targets.length > 1) {{
-                        selected = selectHighestWeightTarget(route.targets, route.weights);
+                    const candidates = getRouteCandidates(route, model);
+                    if (req._hasThinkingSignature && candidates.targets.length > 1) {{
+                        selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
                         routingDecision = 'thinking_primary_fallback';
                     }} else {{
-                        selected = weightedRandom(route.targets, route.weights);
+                        selected = weightedRandom(candidates.targets, candidates.weights);
+                        routingDecision = candidates.cooledOut ? 'weighted_random_all_targets_in_cooldown' : 'weighted_random';
                     }}
-                    setStickyTarget(key, selected);
                 }}
-            }} else if (req._hasThinkingSignature && route.targets.length > 1) {{
-                selected = selectHighestWeightTarget(route.targets, route.weights);
-                routingDecision = 'thinking_primary_fallback_no_session';
             }} else {{
-                selected = weightedRandom(route.targets, route.weights);
+                const candidates = getRouteCandidates(route, model);
+                if (req._hasThinkingSignature && candidates.targets.length > 1) {{
+                    selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
+                    routingDecision = 'thinking_primary_fallback_no_session';
+                }} else {{
+                    selected = weightedRandom(candidates.targets, candidates.weights);
+                    routingDecision = candidates.cooledOut ? 'weighted_random_no_session_all_targets_in_cooldown' : 'weighted_random';
+                }}
             }}
 
+            if (!selected) {{
+                req._targetUrl = DEFAULT_TARGET;
+                req._routingDecision = 'default_target_no_selected';
+                proxy.web(req, res, {{ target: DEFAULT_TARGET, buffer: require('stream').Readable.from([rawBody]) }});
+                return;
+            }}
+
+            req._selectedTarget = selected;
             req._targetInstance = selected.instance;
             req._targetUrl = selected.target;
             req._rewrittenModel = selected.rewrite;
