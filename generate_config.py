@@ -58,12 +58,20 @@ def ensure_dir(path):
 def generate_instance_config(name, instance_conf, routing, global_conf):
     """生成物理实例配置 (兼容当前 cliproxy 配置格式)"""
 
+    request_retry = instance_conf.get("request_retry", global_conf.get("request_retry", 3))
+    max_retry_interval = instance_conf.get("max_retry_interval", global_conf.get("max_retry_interval", 30))
+    routing_strategy = instance_conf.get("routing_strategy", global_conf.get("routing_strategy"))
+
     yaml_conf = {
         "host": global_conf.get("host", "0.0.0.0"),
         "port": instance_conf["port"],
         "proxy-url": global_conf.get("proxy", ""),
-        "auth-dir": BASE_DIR
+        "auth-dir": BASE_DIR,
+        "request-retry": max(0, int(request_retry)),
+        "max-retry-interval": max(0, int(max_retry_interval)),
     }
+    if routing_strategy:
+        yaml_conf["routing"] = {"strategy": routing_strategy}
 
     claude_keys = []
     openai_compat = []
@@ -160,7 +168,7 @@ def ensure_node_deps(base_dir):
         print("📦 安装 Node.js 依赖 (http-proxy)...")
         os.system(f"cd {base_dir} && npm install")
 
-def create_node_lb_script(path, routing, instances, port):
+def create_node_lb_script(path, routing, instances, port, global_conf):
     """生成 Node.js 版本的智能负载均衡器 (支持 HTTP/SSE/WebSocket + 完整日志)"""
 
     routes = {}
@@ -192,6 +200,12 @@ def create_node_lb_script(path, routing, instances, port):
                 "weights": route_weights
             }
 
+    auth_cooldown_ms = int(global_conf.get("lb_auth_cooldown_ms", 5 * 60 * 1000))
+    transient_cooldown_ms = int(global_conf.get("lb_transient_cooldown_ms", 60 * 1000))
+    transient_heavy_cooldown_ms = int(global_conf.get("lb_transient_heavy_cooldown_ms", 2 * 60 * 1000))
+    signature_cooldown_ms = int(global_conf.get("lb_signature_cooldown_ms", 2 * 60 * 1000))
+    max_target_retries = max(0, int(global_conf.get("lb_max_target_retries", 1)))
+
     script_content = f"""
 const http = require('http');
 const httpProxy = require('http-proxy');
@@ -210,10 +224,12 @@ const STICKY_ROUTE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const STICKY_CLEANUP_MS = 10 * 60 * 1000;
 const MAX_STICKY_KEYS = 500;
 const TARGET_COOLDOWN_CLEANUP_MS = 10 * 1000;
-const AUTH_COOLDOWN_MS = 5 * 60 * 1000;
-const TRANSIENT_COOLDOWN_MS = 60 * 1000;
-const TRANSIENT_HEAVY_COOLDOWN_MS = 2 * 60 * 1000;
-const SIGNATURE_COOLDOWN_MS = 2 * 60 * 1000;
+const AUTH_COOLDOWN_MS = {auth_cooldown_ms};
+const TRANSIENT_COOLDOWN_MS = {transient_cooldown_ms};
+const TRANSIENT_HEAVY_COOLDOWN_MS = {transient_heavy_cooldown_ms};
+const SIGNATURE_COOLDOWN_MS = {signature_cooldown_ms};
+const MAX_TARGET_RETRIES = {max_target_retries};
+const RETRYABLE_ROUTE_ACTIONS = new Set(['auth', 'transient']);
 const stickyRoutes = new Map();
 const targetCooldowns = new Map();
 
@@ -416,6 +432,90 @@ function summarizeRequestBody(body) {{
     return summary;
 }}
 
+function targetIdentity(target) {{
+    if (!target) return '';
+    return `${{target.instance}}::${{target.target}}::${{target.rewrite}}`;
+}}
+
+function ensureTriedTargets(req) {{
+    if (!req._triedTargets) {{
+        req._triedTargets = new Set();
+    }}
+    return req._triedTargets;
+}}
+
+function markTriedTarget(req, target) {{
+    const key = targetIdentity(target);
+    if (!key) return;
+    ensureTriedTargets(req).add(key);
+}}
+
+function hasTriedTarget(req, target) {{
+    const key = targetIdentity(target);
+    if (!key || !req._triedTargets) return false;
+    return req._triedTargets.has(key);
+}}
+
+function cloneRequestPayloadForTarget(req, target) {{
+    if (!req._requestBody || typeof req._requestBody !== 'object') {{
+        if (Buffer.isBuffer(req._rawBodyBuffer)) return req._rawBodyBuffer;
+        return Buffer.from('');
+    }}
+    const payload = JSON.parse(JSON.stringify(req._requestBody));
+    if (typeof req._model === 'string' && req._model.length > 0) {{
+        payload.model = (target?.rewrite && target.rewrite !== req._model)
+            ? target.rewrite
+            : req._model;
+    }}
+    return Buffer.from(JSON.stringify(payload));
+}}
+
+function applySelectedTarget(req, target, decision) {{
+    req._selectedTarget = target;
+    req._targetInstance = target.instance;
+    req._targetUrl = target.target;
+    req._rewrittenModel = target.rewrite;
+    req._targetProvider = target.provider || null;
+    if (decision) {{
+        req._routingDecision = decision;
+    }}
+}}
+
+function forwardRequestToTarget(req, res, target, decision) {{
+    applySelectedTarget(req, target, decision);
+    markTriedTarget(req, target);
+    req._attemptStartedAt = Date.now();
+    const forwardBody = cloneRequestPayloadForTarget(req, target);
+    req.headers['content-length'] = Buffer.byteLength(forwardBody);
+    proxy.web(req, res, {{
+        target: target.target,
+        buffer: require('stream').Readable.from([forwardBody])
+    }});
+}}
+
+function pickRetryTarget(req) {{
+    if (!req._model) return null;
+    const route = ROUTES[req._model];
+    if (!route) return null;
+    const current = req._selectedTarget || null;
+    const candidates = getRouteCandidates(route, req._model);
+    const nextTargets = [];
+    const nextWeights = [];
+    for (let i = 0; i < candidates.targets.length; i++) {{
+        const candidate = candidates.targets[i];
+        if (current && targetIdentity(candidate) === targetIdentity(current)) {{
+            continue;
+        }}
+        if (hasTriedTarget(req, candidate)) {{
+            continue;
+        }}
+        nextTargets.push(candidate);
+        nextWeights.push(candidates.weights[i] || 1);
+    }}
+    if (!nextTargets.length) return null;
+    return weightedRandom(nextTargets, nextWeights);
+}}
+
 const proxy = httpProxy.createProxyServer({{
     xfwd: true,
     ws: true,
@@ -434,24 +534,31 @@ proxy.on('error', (err, req, res) => {{
 proxy.on('proxyRes', (proxyRes, req, res) => {{
     const startTime = req._startTime || Date.now();
     const chunks = [];
-
-    // 复制响应头
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    const contentType = proxyRes.headers['content-type'] || '';
+    const isSSE = contentType.includes('text/event-stream');
+    if (isSSE) {{
+        // SSE 需要尽快透传，避免客户端超时
+        res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    }}
 
     proxyRes.on('data', (chunk) => {{
         chunks.push(chunk);
-        res.write(chunk);
+        if (isSSE) {{
+            res.write(chunk);
+        }}
     }});
 
     proxyRes.on('end', () => {{
-        res.end();
-
         const duration = Date.now() - startTime;
         const responseBody = Buffer.concat(chunks).toString('utf-8');
+        const responsePreview = responseBody.length > RESPONSE_PREVIEW_LIMIT
+            ? responseBody.slice(0, RESPONSE_PREVIEW_LIMIT) + '...[truncated]'
+            : responseBody;
+        const attemptStartedAt = req._attemptStartedAt || startTime;
+        const attemptDuration = Date.now() - attemptStartedAt;
 
         // 提取 token 使用信息
         let usage = null;
-        const contentType = proxyRes.headers['content-type'] || '';
         const routeAction = classifyResponse(
             proxyRes.statusCode || 0,
             contentType,
@@ -478,10 +585,46 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             req._cooldownMsApplied = routeAction.cooldownMs;
         }}
 
+        const canRetry = !isSSE &&
+            req.method === 'POST' &&
+            (req._retryCount || 0) < MAX_TARGET_RETRIES &&
+            RETRYABLE_ROUTE_ACTIONS.has(routeAction.kind) &&
+            !res.headersSent;
+        if (canRetry) {{
+            const retryTarget = pickRetryTarget(req);
+            if (retryTarget) {{
+                if (!Array.isArray(req._retryTrace)) {{
+                    req._retryTrace = [];
+                }}
+                req._retryTrace.push({{
+                    from_instance: req._targetInstance || null,
+                    from_url: req._targetUrl || null,
+                    from_model: req._rewrittenModel || req._model || null,
+                    status_code: proxyRes.statusCode || 0,
+                    route_action: routeAction.kind,
+                    attempt_duration_ms: attemptDuration,
+                    body_preview: responsePreview
+                }});
+                req._retryCount = (req._retryCount || 0) + 1;
+                req._routingDecision = `retry_on_${{routeAction.kind}}`;
+                forwardRequestToTarget(req, res, retryTarget, req._routingDecision);
+                return;
+            }}
+        }}
+
         if (contentType.includes('text/event-stream')) {{
             usage = extractUsageFromSSE(responseBody);
         }} else if (contentType.includes('application/json')) {{
             usage = extractUsageFromJSON(responseBody);
+        }}
+
+        if (isSSE) {{
+            res.end();
+        }} else {{
+            if (!res.headersSent) {{
+                res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            }}
+            res.end(responseBody);
         }}
 
         // 构建日志条目
@@ -503,15 +646,17 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
                 decision: req._routingDecision || null,
                 session_key_hash: req._sessionKeyHash || null,
                 has_thinking_signature: req._hasThinkingSignature || false,
-                sticky_action: req._stickyAction || 'none'
+                sticky_action: req._stickyAction || 'none',
+                retry_count: req._retryCount || 0,
+                tried_targets: req._triedTargets ? [...req._triedTargets] : [],
+                retry_attempts: Array.isArray(req._retryTrace) ? req._retryTrace.length : 0,
+                retry_trace: Array.isArray(req._retryTrace) ? req._retryTrace : []
             }},
             response: {{
                 status_code: proxyRes.statusCode,
                 headers: proxyRes.headers,
                 body_length: responseBody.length,
-                body_preview: responseBody.length > RESPONSE_PREVIEW_LIMIT
-                    ? responseBody.slice(0, RESPONSE_PREVIEW_LIMIT) + '...[truncated]'
-                    : responseBody,
+                body_preview: responsePreview,
                 route_action: req._routeAction || null,
                 cooldown_ms_applied: req._cooldownMsApplied || 0
             }},
@@ -696,8 +841,12 @@ const server = http.createServer((req, res) => {{
             }}
 
             req._requestBody = jsonBody;
+            req._rawBodyBuffer = rawBody;
             req._model = model;
             req._hasThinkingSignature = hasThinkingSignature(jsonBody);
+            req._retryCount = 0;
+            req._triedTargets = new Set();
+            req._retryTrace = [];
             const sessionKey = getSessionKey(req, jsonBody);
             req._sessionKeyHash = hashSessionKey(sessionKey);
 
@@ -758,28 +907,7 @@ const server = http.createServer((req, res) => {{
                 return;
             }}
 
-            req._selectedTarget = selected;
-            req._targetInstance = selected.instance;
-            req._targetUrl = selected.target;
-            req._rewrittenModel = selected.rewrite;
-            req._targetProvider = selected.provider || null;
-            req._routingDecision = routingDecision;
-
-            if (selected.rewrite !== model) {{
-                jsonBody.model = selected.rewrite;
-                const newBodyStr = JSON.stringify(jsonBody);
-                req.headers['content-length'] = Buffer.byteLength(newBodyStr);
-                req._requestBody = jsonBody;
-                proxy.web(req, res, {{
-                    target: selected.target,
-                    buffer: require('stream').Readable.from([newBodyStr])
-                }});
-            }} else {{
-                proxy.web(req, res, {{
-                    target: selected.target,
-                    buffer: require('stream').Readable.from([rawBody])
-                }});
-            }}
+            forwardRequestToTarget(req, res, selected, routingDecision);
         }});
     }} else {{
         proxy.web(req, res, {{ target: DEFAULT_TARGET }});
@@ -882,7 +1010,7 @@ def main():
 
     # 2. 生成主入口 LB (Node.js)
     lb_script = os.path.join(BASE_DIR, "lb.js")
-    create_node_lb_script(lb_script, routing, instances, global_conf["main_port"])
+    create_node_lb_script(lb_script, routing, instances, global_conf["main_port"], global_conf)
 
     # 确保 Node 依赖已安装
     ensure_node_deps(BASE_DIR)
