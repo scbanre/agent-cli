@@ -7,6 +7,7 @@ proxy = "http://127.0.0.1:10808"
 request_retry = 3                # 实例内自动重试（403/5xx 等）
 max_retry_interval = 30          # 最长等待冷却秒数
 lb_auth_cooldown_ms = 1800000    # LB 认证类错误冷却 30 分钟
+lb_validation_cooldown_ms = 43200000 # LB 验证类 403 冷却 12 小时
 lb_max_target_retries = 1        # LB 首包前最多自动切换重试次数
 
 # ==========================================

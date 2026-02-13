@@ -201,6 +201,7 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
             }
 
     auth_cooldown_ms = int(global_conf.get("lb_auth_cooldown_ms", 5 * 60 * 1000))
+    validation_cooldown_ms = int(global_conf.get("lb_validation_cooldown_ms", 12 * 60 * 60 * 1000))
     transient_cooldown_ms = int(global_conf.get("lb_transient_cooldown_ms", 60 * 1000))
     transient_heavy_cooldown_ms = int(global_conf.get("lb_transient_heavy_cooldown_ms", 2 * 60 * 1000))
     signature_cooldown_ms = int(global_conf.get("lb_signature_cooldown_ms", 2 * 60 * 1000))
@@ -225,6 +226,7 @@ const STICKY_CLEANUP_MS = 10 * 60 * 1000;
 const MAX_STICKY_KEYS = 500;
 const TARGET_COOLDOWN_CLEANUP_MS = 10 * 1000;
 const AUTH_COOLDOWN_MS = {auth_cooldown_ms};
+const VALIDATION_COOLDOWN_MS = {validation_cooldown_ms};
 const TRANSIENT_COOLDOWN_MS = {transient_cooldown_ms};
 const TRANSIENT_HEAVY_COOLDOWN_MS = {transient_heavy_cooldown_ms};
 const SIGNATURE_COOLDOWN_MS = {signature_cooldown_ms};
@@ -349,11 +351,16 @@ function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {
     }}
 
     const summary = parseErrorSummary(contentType, body);
+    const isValidationError = statusCode === 403 &&
+        (summary.includes('validation_required') ||
+         summary.includes('verify your account') ||
+         summary.includes('validation_url'));
     const isAuthError = summary.includes('auth_unavailable') ||
         summary.includes('auth_not_found') ||
         statusCode === 401 || statusCode === 403;
     if (isAuthError) {{
-        return {{ kind: 'auth', clearSticky: true, cooldownMs: AUTH_COOLDOWN_MS }};
+        const cooldownMs = isValidationError ? VALIDATION_COOLDOWN_MS : AUTH_COOLDOWN_MS;
+        return {{ kind: 'auth', clearSticky: true, cooldownMs }};
     }}
 
     const isSignatureError = hasThinkingSignature &&
@@ -861,10 +868,6 @@ const server = http.createServer((req, res) => {{
             let selected = null;
             let routingDecision = 'weighted_random';
 
-            const allWeights = Array.isArray(route.weights)
-                ? route.weights
-                : route.targets.map(() => 1);
-
             if (req._hasThinkingSignature) {{
                 if (sessionKey) {{
                     const key = stickyRouteKey(sessionKey, model);
@@ -874,12 +877,18 @@ const server = http.createServer((req, res) => {{
                     if (selected) {{
                         routingDecision = 'sticky_session_model_thinking_locked';
                     }} else {{
-                        selected = selectHighestWeightTarget(route.targets, allWeights);
-                        routingDecision = 'thinking_primary_locked';
+                        const candidates = getRouteCandidates(route, model);
+                        selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
+                        routingDecision = candidates.cooledOut
+                            ? 'thinking_primary_locked_all_targets_in_cooldown'
+                            : 'thinking_primary_locked';
                     }}
                 }} else {{
-                    selected = selectHighestWeightTarget(route.targets, allWeights);
-                    routingDecision = 'thinking_primary_locked_no_session';
+                    const candidates = getRouteCandidates(route, model);
+                    selected = selectHighestWeightTarget(candidates.targets, candidates.weights);
+                    routingDecision = candidates.cooledOut
+                        ? 'thinking_primary_locked_no_session_all_targets_in_cooldown'
+                        : 'thinking_primary_locked_no_session';
                 }}
             }} else {{
                 if (sessionKey) {{
