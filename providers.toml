@@ -6,10 +6,24 @@ main_port = 8145                 # 主聚合端口
 proxy = "http://127.0.0.1:10808"
 request_retry = 3                # 实例内自动重试（403/5xx 等）
 max_retry_interval = 30          # 最长等待冷却秒数
+nonstream_keepalive_interval = 5 # 非流式保活（秒），减少长请求超时误判
+streaming_keepalive_seconds = 15 # SSE 心跳（秒）
+streaming_bootstrap_retries = 1  # 流式首包前安全重试
+quota_switch_project = true      # 配额超限时自动切换账号/项目
+quota_switch_preview_model = true # 配额超限时可自动切 preview 模型
 lb_auth_cooldown_ms = 1800000    # LB 认证类错误冷却 30 分钟
 lb_validation_cooldown_ms = 43200000 # LB 验证类 403 冷却 12 小时
 lb_quota_cooldown_ms = 43200000  # LB 配额类错误冷却 12 小时
 lb_max_target_retries = 1        # LB 首包前最多自动切换重试次数
+lb_auto_upgrade_enabled = true
+lb_auto_upgrade_messages_threshold = 80
+lb_auto_upgrade_tools_threshold = 10
+lb_auto_upgrade_failure_streak_threshold = 2
+lb_auto_upgrade_signature_enabled = true
+
+[global.lb_auto_upgrade_map]
+"g3f.auto" = "opus4.6"
+"g3p.auto" = "opus4.6"
 
 # ==========================================
 # 1. 物理实例定义 (Instances)
@@ -21,6 +35,8 @@ lb_max_target_retries = 1        # LB 首包前最多自动切换重试次数
 # 均使用 OAuth 登录，无需在此填 Key
 [instances.official]
 port = 8146
+request_retry = 1
+max_retry_interval = 5
 providers = [
   # 1. Antigravity (Google OAuth)
   # 需运行: ./cliproxy --antigravity-login
@@ -35,6 +51,8 @@ providers = [
 [instances.zenmux]
 port = 8147
 disable_cooling = true
+request_retry = 2
+max_retry_interval = 15
 providers = [
   # Endpoint 1: OpenAI 兼容 (GPT, DeepSeek, Kimi)
   { type = "openai", base_url = "https://zenmux.ai/api/v1", api_keys = [
@@ -59,18 +77,28 @@ providers = [
 [routing]
 
 "opus4.6" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80 },
-  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20 },
+  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "max_tokens_max" = 24000 } },
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "max_tokens_max" = 24000 } },
 ]
 
 "g3p" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
-  { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high" } },
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "max_tokens_max" = 16000 } },
 ]
 
 "g3f" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999 },
-  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1 },
+  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
+]
+
+"g3f.auto" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
+]
+
+"g3p.auto" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "max_tokens_max" = 16000 } },
 ]
 
 "g3i" = [

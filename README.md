@@ -68,6 +68,7 @@ cld official           # 官方模式
 - `cp` 模式会分别设置 `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL`
 - `cp` 模式会把最近一次选择缓存到 `~/.cache/cld/cp/last_*`，下次可复用
 - 子 Agent 模型通过 `CLAUDE_CODE_SUBAGENT_MODEL` 跟随 fast 角色
+- `cp` 场景选择支持 `Auto Upgrade` 开关：当 Main 为 `g3f/g3p` 时可切到 `g3f.auto/g3p.auto`（由 LB 按阈值自动升档到 `opus4.6`）
 - `ag` 模式可用 `CLD_AG_CODE_MODEL` / `CLD_AG_DOC_MODEL` / `CLD_AG_FAST_MODEL` 覆盖默认模型
 
 ## 快速开始
@@ -124,8 +125,10 @@ pm2 logs                     # 查看日志
 - 当 Gemini 3 Pro 走 relay（如 `google/gemini-3-pro-preview`）时，建议配置：
   - `params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 }`
 - 该上限用于约束过大的 `thinking.budget_tokens`，避免被后端映射为不支持的 `xhigh` 并返回 400
+- 可用 `params.max_tokens_max` / `params.max_tokens_default` 控制输出上限与默认值，优化延迟与 token 开销
 - Claude 1M context 建议通过路由 `params.anthropic_beta` 配置（可选，默认不加）
 - 如需注入其他请求头，可使用 `params.extra_headers`（按路由目标生效）
+- `providers.toml` 支持实例级 `request_retry/max_retry_interval` 与全局 `streaming_*` / `quota_switch_*` 透传到 cliproxy 配置
 
 ## 详细文档
 

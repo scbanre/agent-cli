@@ -9,6 +9,31 @@
 host = "0.0.0.0"
 main_port = 8145        # LB 对外端口
 proxy = "http://..."    # 可选代理
+request_retry = 3
+max_retry_interval = 30
+nonstream_keepalive_interval = 5
+streaming_keepalive_seconds = 15
+streaming_bootstrap_retries = 1
+quota_switch_project = true
+quota_switch_preview_model = true
+lb_auto_upgrade_enabled = true
+lb_auto_upgrade_messages_threshold = 80
+lb_auto_upgrade_tools_threshold = 10
+lb_auto_upgrade_failure_streak_threshold = 2
+lb_auto_upgrade_signature_enabled = true
+```
+
+- `request_retry` / `max_retry_interval`: 实例默认重试策略（可被 `[instances.xxx]` 覆盖）
+- `nonstream_keepalive_interval`: 非流式请求保活间隔（秒）
+- `streaming_keepalive_seconds` / `streaming_bootstrap_retries`: 流式心跳与首包前安全重试
+- `quota_switch_project` / `quota_switch_preview_model`: 配额超限时的自动切换策略
+- `lb_auto_upgrade_*`: LB 自动升档阈值开关（按请求复杂度与失败连击）
+
+可选模型升档映射（常用于 `g3f.auto -> opus4.6`）：
+
+```toml
+[global.lb_auto_upgrade_map]
+"g3f.auto" = "opus4.6"
 ```
 
 ## 2. 物理实例
@@ -16,6 +41,8 @@ proxy = "http://..."    # 可选代理
 ```toml
 [instances.official]
 port = 8146
+request_retry = 1
+max_retry_interval = 5
 providers = [
   { type = "antigravity", rotation_strategy = "round-robin" },
   { type = "codex", rotation_strategy = "round-robin" },
@@ -27,6 +54,9 @@ providers = [
   { type = "openai", base_url = "...", api_keys = ["${ZENMUX_KEY}"] },
 ]
 ```
+
+- `request_retry` / `max_retry_interval` / `disable_cooling` / `routing_strategy` 支持实例级覆盖
+- `streaming` 与 `quota_exceeded` 也支持实例级 table 覆盖（例如 `[instances.official.streaming]`）
 
 ## 3. 路由规则
 
@@ -48,6 +78,8 @@ providers = [
 
 - `reasoning_effort`: 例如 `low` / `medium` / `high`
 - `thinking_budget_max`: 限制 `thinking.budget_tokens` 的上限，避免后端把过大预算映射到不支持的等级
+- `max_tokens_max`: 限制 `max_tokens` 上限，降低超长输出导致的延迟与费用
+- `max_tokens_default`: 客户端未传 `max_tokens` 时补默认值
 - `anthropic_beta`: 追加到 `anthropic-beta` 请求头（会与客户端已有值去重合并）
 - `extra_headers`: 注入额外请求头（键名不区分大小写；会忽略 `content-length` / `host`）
 
@@ -57,6 +89,15 @@ Gemini 3 Pro relay 推荐写法：
 "gemini-pro" = [
   { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
   { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 } },
+]
+```
+
+自动升档别名示例：
+
+```toml
+"g3f.auto" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999 },
+  { instance = "relay", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1 },
 ]
 ```
 

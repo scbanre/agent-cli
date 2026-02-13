@@ -55,6 +55,35 @@ def ensure_dir(path):
     if not os.path.exists(path):
         os.makedirs(path)
 
+def coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", ""}:
+            return False
+    raise ValueError(f"invalid boolean value: {value}")
+
+def coerce_int(value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        return int(value.strip())
+    raise ValueError(f"invalid integer value: {value}")
+
+def pick_conf(instance_conf, global_conf, key):
+    if key in instance_conf:
+        return instance_conf[key]
+    return global_conf.get(key)
+
 def generate_instance_config(name, instance_conf, routing, global_conf):
     """生成物理实例配置 (兼容当前 cliproxy 配置格式)"""
 
@@ -72,6 +101,66 @@ def generate_instance_config(name, instance_conf, routing, global_conf):
     }
     if routing_strategy:
         yaml_conf["routing"] = {"strategy": routing_strategy}
+
+    disable_cooling = pick_conf(instance_conf, global_conf, "disable_cooling")
+    if disable_cooling is not None:
+        yaml_conf["disable-cooling"] = coerce_bool(disable_cooling)
+
+    nonstream_keepalive_interval = pick_conf(instance_conf, global_conf, "nonstream_keepalive_interval")
+    if nonstream_keepalive_interval is not None:
+        yaml_conf["nonstream-keepalive-interval"] = max(0, coerce_int(nonstream_keepalive_interval))
+
+    instance_streaming = instance_conf.get("streaming", {}) if isinstance(instance_conf.get("streaming"), dict) else {}
+    global_streaming = global_conf.get("streaming", {}) if isinstance(global_conf.get("streaming"), dict) else {}
+
+    keepalive_seconds = (
+        instance_streaming.get("keepalive_seconds", instance_streaming.get("keepalive-seconds"))
+        if instance_streaming else None
+    )
+    if keepalive_seconds is None:
+        keepalive_seconds = pick_conf(instance_conf, global_conf, "streaming_keepalive_seconds")
+    if keepalive_seconds is None:
+        keepalive_seconds = global_streaming.get("keepalive_seconds", global_streaming.get("keepalive-seconds"))
+
+    bootstrap_retries = (
+        instance_streaming.get("bootstrap_retries", instance_streaming.get("bootstrap-retries"))
+        if instance_streaming else None
+    )
+    if bootstrap_retries is None:
+        bootstrap_retries = pick_conf(instance_conf, global_conf, "streaming_bootstrap_retries")
+    if bootstrap_retries is None:
+        bootstrap_retries = global_streaming.get("bootstrap_retries", global_streaming.get("bootstrap-retries"))
+
+    streaming_conf = {}
+    if keepalive_seconds is not None:
+        streaming_conf["keepalive-seconds"] = max(0, coerce_int(keepalive_seconds))
+    if bootstrap_retries is not None:
+        streaming_conf["bootstrap-retries"] = max(0, coerce_int(bootstrap_retries))
+    if streaming_conf:
+        yaml_conf["streaming"] = streaming_conf
+
+    instance_quota = instance_conf.get("quota_exceeded", {}) if isinstance(instance_conf.get("quota_exceeded"), dict) else {}
+    global_quota = global_conf.get("quota_exceeded", {}) if isinstance(global_conf.get("quota_exceeded"), dict) else {}
+
+    switch_project = pick_conf(instance_conf, global_conf, "quota_switch_project")
+    if switch_project is None:
+        switch_project = instance_quota.get("switch_project", instance_quota.get("switch-project"))
+    if switch_project is None:
+        switch_project = global_quota.get("switch_project", global_quota.get("switch-project"))
+
+    switch_preview_model = pick_conf(instance_conf, global_conf, "quota_switch_preview_model")
+    if switch_preview_model is None:
+        switch_preview_model = instance_quota.get("switch_preview_model", instance_quota.get("switch-preview-model"))
+    if switch_preview_model is None:
+        switch_preview_model = global_quota.get("switch_preview_model", global_quota.get("switch-preview-model"))
+
+    quota_conf = {}
+    if switch_project is not None:
+        quota_conf["switch-project"] = coerce_bool(switch_project)
+    if switch_preview_model is not None:
+        quota_conf["switch-preview-model"] = coerce_bool(switch_preview_model)
+    if quota_conf:
+        yaml_conf["quota-exceeded"] = quota_conf
 
     claude_keys = []
     openai_compat = []
@@ -186,12 +275,16 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
                 if not default_target:
                     default_target = target_url
                 weight = t.get("weight", 1)
-                route_targets.append({
+                target_entry = {
                     "target": target_url,
                     "rewrite": t["model"],
                     "instance": inst_name,
                     "provider": t.get("provider", "unknown")
-                })
+                }
+                route_params = t.get("params")
+                if isinstance(route_params, dict) and route_params:
+                    target_entry["params"] = route_params
+                route_targets.append(target_entry)
                 route_weights.append(weight)
 
         if route_targets:
@@ -207,6 +300,19 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
     signature_cooldown_ms = int(global_conf.get("lb_signature_cooldown_ms", 2 * 60 * 1000))
     quota_cooldown_ms = int(global_conf.get("lb_quota_cooldown_ms", 12 * 60 * 60 * 1000))
     max_target_retries = max(0, int(global_conf.get("lb_max_target_retries", 1)))
+    auto_upgrade_enabled = coerce_bool(global_conf.get("lb_auto_upgrade_enabled", False))
+    auto_upgrade_messages_threshold = max(1, coerce_int(global_conf.get("lb_auto_upgrade_messages_threshold", 80)))
+    auto_upgrade_tools_threshold = max(1, coerce_int(global_conf.get("lb_auto_upgrade_tools_threshold", 10)))
+    auto_upgrade_failure_streak_threshold = max(1, coerce_int(global_conf.get("lb_auto_upgrade_failure_streak_threshold", 2)))
+    auto_upgrade_signature_enabled = coerce_bool(global_conf.get("lb_auto_upgrade_signature_enabled", True))
+    raw_auto_upgrade_map = global_conf.get("lb_auto_upgrade_map", {})
+    auto_upgrade_map = {}
+    if isinstance(raw_auto_upgrade_map, dict):
+        for source_model, target_model in raw_auto_upgrade_map.items():
+            source = str(source_model).strip()
+            target = str(target_model).strip()
+            if source and target and source != target:
+                auto_upgrade_map[source] = target
 
     script_content = f"""
 const http = require('http');
@@ -233,9 +339,18 @@ const TRANSIENT_HEAVY_COOLDOWN_MS = {transient_heavy_cooldown_ms};
 const SIGNATURE_COOLDOWN_MS = {signature_cooldown_ms};
 const QUOTA_COOLDOWN_MS = {quota_cooldown_ms};
 const MAX_TARGET_RETRIES = {max_target_retries};
+const AUTO_UPGRADE_ENABLED = {str(auto_upgrade_enabled).lower()};
+const AUTO_UPGRADE_MODEL_MAP = {json.dumps(auto_upgrade_map, indent=2)};
+const AUTO_UPGRADE_MESSAGES_THRESHOLD = {auto_upgrade_messages_threshold};
+const AUTO_UPGRADE_TOOLS_THRESHOLD = {auto_upgrade_tools_threshold};
+const AUTO_UPGRADE_FAILURE_STREAK_THRESHOLD = {auto_upgrade_failure_streak_threshold};
+const AUTO_UPGRADE_SIGNATURE_ENABLED = {str(auto_upgrade_signature_enabled).lower()};
+const MODEL_HEALTH_TTL_MS = 2 * 60 * 60 * 1000;
+const MODEL_HEALTH_CLEANUP_MS = 10 * 60 * 1000;
 const RETRYABLE_ROUTE_ACTIONS = new Set(['auth', 'transient']);
 const stickyRoutes = new Map();
 const targetCooldowns = new Map();
+const modelHealth = new Map();
 
 // 确保日志目录存在
 if (!fs.existsSync(LOG_DIR)) {{
@@ -291,6 +406,17 @@ setInterval(() => {{
         if (value.expiresAt <= now) targetCooldowns.delete(key);
     }}
 }}, TARGET_COOLDOWN_CLEANUP_MS);
+
+function cleanupModelHealth() {{
+    const now = Date.now();
+    for (const [key, value] of modelHealth.entries()) {{
+        if (!value || (value.updatedAt || 0) + MODEL_HEALTH_TTL_MS <= now) {{
+            modelHealth.delete(key);
+        }}
+    }}
+}}
+
+setInterval(cleanupModelHealth, MODEL_HEALTH_CLEANUP_MS);
 
 // 从 SSE 流中提取 usage 信息
 function extractUsageFromSSE(chunks) {{
@@ -505,6 +631,129 @@ function hasTriedTarget(req, target) {{
     return req._triedTargets.has(key);
 }}
 
+function toPositiveInt(value) {{
+    const num = Number(value);
+    if (!Number.isFinite(num)) return null;
+    const asInt = Math.floor(num);
+    return asInt > 0 ? asInt : null;
+}}
+
+function mergeCommaHeader(existingValue, appendValue) {{
+    if (typeof appendValue !== 'string' || !appendValue.trim()) return existingValue;
+    const existingParts = String(existingValue || '')
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+    const existingSet = new Set(existingParts.map((part) => part.toLowerCase()));
+    const extraParts = appendValue
+        .split(',')
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+    for (const part of extraParts) {{
+        const normalized = part.toLowerCase();
+        if (!existingSet.has(normalized)) {{
+            existingParts.push(part);
+            existingSet.add(normalized);
+        }}
+    }}
+    return existingParts.join(',');
+}}
+
+function summarizeTargetParams(params) {{
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+    const summary = {{}};
+    if (typeof params.reasoning_effort === 'string' && params.reasoning_effort.trim()) {{
+        summary.reasoning_effort = params.reasoning_effort.trim();
+    }}
+    const thinkingBudgetMax = toPositiveInt(params.thinking_budget_max);
+    if (thinkingBudgetMax) {{
+        summary.thinking_budget_max = thinkingBudgetMax;
+    }}
+    const maxTokensMax = toPositiveInt(params.max_tokens_max);
+    if (maxTokensMax) {{
+        summary.max_tokens_max = maxTokensMax;
+    }}
+    const maxTokensDefault = toPositiveInt(params.max_tokens_default);
+    if (maxTokensDefault) {{
+        summary.max_tokens_default = maxTokensDefault;
+    }}
+    if (typeof params.anthropic_beta === 'string' && params.anthropic_beta.trim()) {{
+        summary.anthropic_beta = params.anthropic_beta.trim();
+    }}
+    if (params.extra_headers && typeof params.extra_headers === 'object' && !Array.isArray(params.extra_headers)) {{
+        summary.extra_header_keys = Object.keys(params.extra_headers)
+            .map((key) => String(key).toLowerCase())
+            .sort();
+    }}
+    return Object.keys(summary).length > 0 ? summary : null;
+}}
+
+function applyTargetHeaders(req, target) {{
+    const baseHeaders = req._baseHeaders && typeof req._baseHeaders === 'object'
+        ? req._baseHeaders
+        : req.headers;
+    req.headers = {{ ...baseHeaders }};
+    const params = target?.params;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return;
+
+    if (typeof params.anthropic_beta === 'string' && params.anthropic_beta.trim()) {{
+        req.headers['anthropic-beta'] = mergeCommaHeader(req.headers['anthropic-beta'], params.anthropic_beta);
+    }}
+
+    if (params.extra_headers && typeof params.extra_headers === 'object' && !Array.isArray(params.extra_headers)) {{
+        for (const [rawKey, rawValue] of Object.entries(params.extra_headers)) {{
+            const key = String(rawKey || '').trim();
+            if (!key) continue;
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === 'content-length' || lowerKey === 'host') continue;
+            if (rawValue == null) continue;
+            req.headers[key] = String(rawValue);
+        }}
+    }}
+}}
+
+function applyTargetParamsToPayload(payload, target) {{
+    const params = target?.params;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return payload;
+
+    if (typeof params.reasoning_effort === 'string' && params.reasoning_effort.trim()) {{
+        payload.reasoning_effort = params.reasoning_effort.trim();
+    }}
+
+    const thinkingBudgetMax = toPositiveInt(params.thinking_budget_max);
+    if (thinkingBudgetMax && payload.thinking && typeof payload.thinking === 'object' && !Array.isArray(payload.thinking)) {{
+        const currentBudget = toPositiveInt(payload.thinking.budget_tokens);
+        if (currentBudget && currentBudget > thinkingBudgetMax) {{
+            payload.thinking.budget_tokens = thinkingBudgetMax;
+        }}
+    }}
+
+    const initialMaxTokens = toPositiveInt(payload.max_tokens);
+    const maxTokensMax = toPositiveInt(params.max_tokens_max);
+    if (maxTokensMax && initialMaxTokens && initialMaxTokens > maxTokensMax) {{
+        payload.max_tokens = maxTokensMax;
+    }}
+
+    const maxTokensDefault = toPositiveInt(params.max_tokens_default);
+    if (maxTokensDefault && !initialMaxTokens) {{
+        payload.max_tokens = maxTokensDefault;
+    }}
+
+    const finalMaxTokens = toPositiveInt(payload.max_tokens);
+    if (finalMaxTokens && payload.thinking && typeof payload.thinking === 'object' && !Array.isArray(payload.thinking)) {{
+        const currentBudget = toPositiveInt(payload.thinking.budget_tokens);
+        if (currentBudget && currentBudget >= finalMaxTokens) {{
+            if (finalMaxTokens <= 1) {{
+                delete payload.thinking.budget_tokens;
+            }} else {{
+                payload.thinking.budget_tokens = finalMaxTokens - 1;
+            }}
+        }}
+    }}
+
+    return payload;
+}}
+
 function cloneRequestPayloadForTarget(req, target) {{
     if (!req._requestBody || typeof req._requestBody !== 'object') {{
         if (Buffer.isBuffer(req._rawBodyBuffer)) return req._rawBodyBuffer;
@@ -516,6 +765,7 @@ function cloneRequestPayloadForTarget(req, target) {{
             ? target.rewrite
             : req._model;
     }}
+    applyTargetParamsToPayload(payload, target);
     return Buffer.from(JSON.stringify(payload));
 }}
 
@@ -525,6 +775,7 @@ function applySelectedTarget(req, target, decision) {{
     req._targetUrl = target.target;
     req._rewrittenModel = target.rewrite;
     req._targetProvider = target.provider || null;
+    req._targetParamSummary = summarizeTargetParams(target?.params);
     if (decision) {{
         req._routingDecision = decision;
     }}
@@ -534,6 +785,7 @@ function forwardRequestToTarget(req, res, target, decision) {{
     applySelectedTarget(req, target, decision);
     markTriedTarget(req, target);
     req._attemptStartedAt = Date.now();
+    applyTargetHeaders(req, target);
     const forwardBody = cloneRequestPayloadForTarget(req, target);
     req.headers['content-length'] = Buffer.byteLength(forwardBody);
     proxy.web(req, res, {{
@@ -661,6 +913,11 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             }}
         }}
 
+        req._modelHealth = updateModelHealth(
+            req._modelHealthKey || null,
+            routeAction.kind === 'success'
+        );
+
         if (contentType.includes('text/event-stream')) {{
             usage = extractUsageFromSSE(responseBody);
         }} else if (contentType.includes('application/json')) {{
@@ -689,13 +946,18 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
                 url: req.url,
                 headers: sanitizeHeaders(req.headers),
                 body: LOG_VERBOSE ? (req._requestBody || null) : summarizeRequestBody(req._requestBody),
-                model: req._model || null
+                model: req._requestedModel || req._model || null
             }},
             routing: {{
+                requested_model: req._requestedModel || null,
+                source_model: req._sourceModel || null,
                 target_instance: req._targetInstance || null,
                 target_url: req._targetUrl || null,
                 rewritten_model: req._rewrittenModel || null,
                 provider: req._targetProvider || null,
+                target_params: req._targetParamSummary || null,
+                auto_upgrade: req._autoUpgrade || null,
+                model_health: req._modelHealth || null,
                 decision: req._routingDecision || null,
                 session_key_hash: req._sessionKeyHash || null,
                 has_thinking_signature: req._hasThinkingSignature || false,
@@ -771,6 +1033,59 @@ function hasThinkingSignature(body) {{
         }}
     }}
     return false;
+}}
+
+function modelHealthKey(sessionKeyHash, sourceModel) {{
+    if (!sourceModel) return null;
+    return `${{sessionKeyHash || 'anon'}}::${{sourceModel}}`;
+}}
+
+function getModelHealth(key) {{
+    if (!key) return {{ failureStreak: 0, successStreak: 0, updatedAt: Date.now() }};
+    const current = modelHealth.get(key);
+    if (!current) return {{ failureStreak: 0, successStreak: 0, updatedAt: Date.now() }};
+    return current;
+}}
+
+function updateModelHealth(key, isSuccess) {{
+    if (!key) return null;
+    const current = getModelHealth(key);
+    const next = {{
+        failureStreak: isSuccess ? 0 : (current.failureStreak || 0) + 1,
+        successStreak: isSuccess ? (current.successStreak || 0) + 1 : 0,
+        updatedAt: Date.now()
+    }};
+    modelHealth.set(key, next);
+    return next;
+}}
+
+function resolveAutoUpgradeModel(requestModel, body, sessionKeyHash) {{
+    if (!AUTO_UPGRADE_ENABLED) return null;
+    const targetModel = AUTO_UPGRADE_MODEL_MAP[requestModel];
+    if (typeof targetModel !== 'string' || targetModel.length === 0) return null;
+    if (!ROUTES[targetModel]) return null;
+
+    const messagesCount = Array.isArray(body?.messages) ? body.messages.length : 0;
+    const toolsCount = Array.isArray(body?.tools) ? body.tools.length : 0;
+    const hasSignature = hasThinkingSignature(body);
+    const health = getModelHealth(modelHealthKey(sessionKeyHash, requestModel));
+    const failureStreak = health.failureStreak || 0;
+    const reasons = [];
+
+    if (messagesCount >= AUTO_UPGRADE_MESSAGES_THRESHOLD) reasons.push('messages_threshold');
+    if (toolsCount >= AUTO_UPGRADE_TOOLS_THRESHOLD) reasons.push('tools_threshold');
+    if (failureStreak >= AUTO_UPGRADE_FAILURE_STREAK_THRESHOLD) reasons.push('failure_streak');
+    if (AUTO_UPGRADE_SIGNATURE_ENABLED && hasSignature) reasons.push('thinking_signature');
+
+    if (!reasons.length) return null;
+    return {{
+        sourceModel: requestModel,
+        targetModel,
+        reasons,
+        messagesCount,
+        toolsCount,
+        failureStreak
+    }};
 }}
 
 function stickyRouteKey(sessionKey, model) {{
@@ -895,13 +1210,26 @@ const server = http.createServer((req, res) => {{
 
             req._requestBody = jsonBody;
             req._rawBodyBuffer = rawBody;
+            req._baseHeaders = {{ ...req.headers }};
+            req._requestedModel = model;
+            req._sourceModel = model;
             req._model = model;
             req._hasThinkingSignature = hasThinkingSignature(jsonBody);
             req._retryCount = 0;
             req._triedTargets = new Set();
             req._retryTrace = [];
+            req._targetParamSummary = null;
+            req._autoUpgrade = null;
             const sessionKey = getSessionKey(req, jsonBody);
             req._sessionKeyHash = hashSessionKey(sessionKey);
+            req._modelHealthKey = modelHealthKey(req._sessionKeyHash, req._sourceModel);
+
+            const autoUpgrade = resolveAutoUpgradeModel(model, jsonBody, req._sessionKeyHash);
+            if (autoUpgrade) {{
+                model = autoUpgrade.targetModel;
+                req._model = model;
+                req._autoUpgrade = autoUpgrade;
+            }}
 
             const route = ROUTES[model];
             if (!route) {{
@@ -913,6 +1241,9 @@ const server = http.createServer((req, res) => {{
 
             let selected = null;
             let routingDecision = 'weighted_random';
+            if (req._autoUpgrade) {{
+                routingDecision = `auto_upgrade_${{req._autoUpgrade.sourceModel}}_to_${{req._autoUpgrade.targetModel}}`;
+            }}
 
             if (req._hasThinkingSignature) {{
                 if (sessionKey) {{
