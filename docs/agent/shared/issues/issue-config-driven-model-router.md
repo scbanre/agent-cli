@@ -61,23 +61,23 @@ value = 40
 
 ## 实施任务
 
-- [ ] 解析 `global.lb_model_router` 配置（含外部 `config_file` 可选加载）
-- [ ] 实现规则引擎（`field/op/value` + `any/all` + `priority`）
-- [ ] 接入 LB 请求路径：在路由前计算 `resolved_model`
-- [ ] 保持现有 sticky/cooldown/retry 语义不被破坏
-- [ ] 增加日志字段：`requested_model/resolved_model/hit_rule/factors/eval_trace`
-- [ ] 增加影子模式 `shadow_only = true`
-- [ ] 补充文档与示例
+- [x] 解析 `global.lb_model_router` 配置（含外部 `config_file` 可选加载）
+- [x] 实现规则引擎（`field/op/value` + `any/all` + `priority`）
+- [x] 接入 LB 请求路径：在路由前计算 `resolved_model`
+- [x] 保持现有 sticky/cooldown/retry 语义不被破坏
+- [x] 增加日志字段：`requested_model/resolved_model/hit_rule/factors/eval_trace`
+- [x] 增加影子模式 `shadow_only = true`
+- [x] 补充文档与示例
 
 ---
 
 ## 验收标准
 
-- [ ] `activation_models=["auto"]` 时，前端固定发 `auto` 可稳定路由到真实模型
-- [ ] 修改规则无需改代码，仅改配置并 reload/restart 生效
-- [ ] 影子模式下线上行为不变，但日志可看到“建议模型”
-- [ ] 关闭开关后可立即回退到现有路由逻辑
-- [ ] 日志可用于统计规则命中率、失败率、延迟、token 成本
+- [x] `activation_models=["auto"]` 时，前端固定发 `auto` 可稳定路由到真实模型
+- [x] 修改规则无需改代码，仅改配置并 reload/restart 生效
+- [x] 影子模式下线上行为不变，但日志可看到“建议模型”
+- [x] 关闭开关后可立即回退到现有路由逻辑
+- [x] 日志可用于统计规则命中率、失败率、延迟、token 成本
 
 ---
 
@@ -87,4 +87,3 @@ value = 40
 2. Phase 2：`auto-canary` 小流量
 3. Phase 3：`auto` 主流量
 4. 回滚：`enabled = false`
-

@@ -1,6 +1,10 @@
 """LB script generator for cliproxy routing."""
 
 import json
+import os
+import re
+
+import toml
 
 
 def coerce_bool(value):
@@ -27,6 +31,160 @@ def coerce_int(value):
     if isinstance(value, str):
         return int(value.strip())
     raise ValueError(f"invalid integer value: {value}")
+
+
+def _substitute_env(data):
+    if isinstance(data, dict):
+        return {k: _substitute_env(v) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_substitute_env(v) for v in data]
+    if isinstance(data, str):
+        return re.sub(r"\$\{([^}]+)\}", lambda m: os.environ.get(m.group(1), m.group(0)), data)
+    return data
+
+
+def _deep_merge_dict(base, override):
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(merged.get(key), dict) and isinstance(value, dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _load_model_router_config_file(lb_script_path, config_file):
+    if not isinstance(config_file, str) or not config_file.strip():
+        return {}
+
+    config_path = config_file.strip()
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(os.path.dirname(os.path.abspath(lb_script_path)), config_path)
+
+    if not os.path.exists(config_path):
+        print(f"⚠️  lb_model_router config_file 不存在，已忽略: {config_path}")
+        return {}
+
+    loaded = _substitute_env(toml.load(config_path))
+    if isinstance(loaded.get("lb_model_router"), dict):
+        return loaded["lb_model_router"]
+    global_conf = loaded.get("global")
+    if isinstance(global_conf, dict) and isinstance(global_conf.get("lb_model_router"), dict):
+        return global_conf.get("lb_model_router", {})
+    if isinstance(loaded, dict):
+        return loaded
+    return {}
+
+
+def _normalize_lb_model_router_config(lb_script_path, global_conf):
+    base_conf = global_conf.get("lb_model_router")
+    if not isinstance(base_conf, dict):
+        base_conf = {}
+    else:
+        base_conf = dict(base_conf)
+
+    config_file = base_conf.get("config_file")
+    if isinstance(config_file, str) and config_file.strip():
+        file_conf = _load_model_router_config_file(lb_script_path, config_file)
+        if isinstance(file_conf, dict) and file_conf:
+            base_conf = _deep_merge_dict(base_conf, file_conf)
+
+    supported_ops = {
+        "==",
+        "!=",
+        ">",
+        ">=",
+        "<",
+        "<=",
+        "in",
+        "not_in",
+        "contains",
+        "not_contains",
+        "exists",
+        "not_exists",
+        "regex",
+    }
+
+    activation_models = []
+    raw_activation_models = base_conf.get("activation_models", ["auto"])
+    if isinstance(raw_activation_models, list):
+        for raw_model in raw_activation_models:
+            model = str(raw_model).strip()
+            if model and model not in activation_models:
+                activation_models.append(model)
+
+    default_model = base_conf.get("default_model")
+    if default_model is not None:
+        default_model = str(default_model).strip() or None
+
+    raw_rules = base_conf.get("rules", [])
+    normalized_rules = []
+    if isinstance(raw_rules, list):
+        for idx, raw_rule in enumerate(raw_rules):
+            if not isinstance(raw_rule, dict):
+                continue
+            target_model = str(raw_rule.get("target_model", "")).strip()
+            if not target_model:
+                continue
+
+            try:
+                priority = coerce_int(raw_rule.get("priority", 0))
+            except Exception:
+                priority = 0
+
+            match_mode = str(raw_rule.get("match", "all")).strip().lower()
+            if match_mode not in {"all", "any"}:
+                match_mode = "all"
+
+            name = str(raw_rule.get("name", f"rule_{idx + 1}")).strip() or f"rule_{idx + 1}"
+
+            conditions = []
+            raw_conditions = raw_rule.get("when", [])
+            if isinstance(raw_conditions, list):
+                for cond in raw_conditions:
+                    if not isinstance(cond, dict):
+                        continue
+                    field = str(cond.get("field", "")).strip()
+                    if not field:
+                        continue
+                    op = str(cond.get("op", "==")).strip().lower()
+                    if op not in supported_ops:
+                        continue
+                    conditions.append(
+                        {
+                            "field": field,
+                            "op": op,
+                            "value": cond.get("value"),
+                        }
+                    )
+
+            normalized_rules.append(
+                {
+                    "name": name,
+                    "priority": priority,
+                    "target_model": target_model,
+                    "match": match_mode,
+                    "when": conditions,
+                }
+            )
+
+    normalized_rules.sort(key=lambda item: item.get("priority", 0), reverse=True)
+
+    enabled = coerce_bool(base_conf.get("enabled", False))
+    shadow_only = coerce_bool(base_conf.get("shadow_only", False))
+    log_factors = coerce_bool(base_conf.get("log_factors", True))
+
+    normalized = {
+        "enabled": enabled,
+        "shadow_only": shadow_only,
+        "log_factors": log_factors,
+        "activation_models": activation_models,
+        "default_model": default_model,
+        "rules": normalized_rules,
+    }
+    if isinstance(config_file, str) and config_file.strip():
+        normalized["config_file"] = config_file.strip()
+    return normalized
 
 def create_node_lb_script(path, routing, instances, port, global_conf):
     """生成 Node.js 版本的智能负载均衡器 (支持 HTTP/SSE/WebSocket + 完整日志)"""
@@ -85,6 +243,7 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
             target = str(target_model).strip()
             if source and target and source != target:
                 auto_upgrade_map[source] = target
+    model_router_conf = _normalize_lb_model_router_config(path, global_conf)
 
     script_content = f"""
 const http = require('http');
@@ -119,6 +278,7 @@ const AUTO_UPGRADE_MESSAGES_THRESHOLD = {auto_upgrade_messages_threshold};
 const AUTO_UPGRADE_TOOLS_THRESHOLD = {auto_upgrade_tools_threshold};
 const AUTO_UPGRADE_FAILURE_STREAK_THRESHOLD = {auto_upgrade_failure_streak_threshold};
 const AUTO_UPGRADE_SIGNATURE_ENABLED = {str(auto_upgrade_signature_enabled).lower()};
+const MODEL_ROUTER_CONFIG = {json.dumps(model_router_conf, indent=2)};
 const MODEL_HEALTH_TTL_MS = 2 * 60 * 60 * 1000;
 const MODEL_HEALTH_CLEANUP_MS = 10 * 60 * 1000;
 const RETRYABLE_ROUTE_ACTIONS = new Set(['auth', 'transient']);
@@ -191,6 +351,335 @@ function cleanupModelHealth() {{
 }}
 
 setInterval(cleanupModelHealth, MODEL_HEALTH_CLEANUP_MS);
+
+function normalizeScalar(value) {{
+    if (typeof value === 'string') {{
+        const trimmed = value.trim();
+        if (trimmed.length === 0) return '';
+        const lower = trimmed.toLowerCase();
+        if (lower === 'true') return true;
+        if (lower === 'false') return false;
+        if (/^-?\d+(\.\d+)?$/.test(trimmed)) {{
+            const num = Number(trimmed);
+            if (Number.isFinite(num)) return num;
+        }}
+        return trimmed;
+    }}
+    return value;
+}}
+
+function toFiniteNumber(value) {{
+    const normalized = normalizeScalar(value);
+    if (typeof normalized === 'number' && Number.isFinite(normalized)) return normalized;
+    return null;
+}}
+
+function scalarEquals(left, right) {{
+    return normalizeScalar(left) === normalizeScalar(right);
+}}
+
+function extractMessageTextLength(content) {{
+    if (typeof content === 'string') return content.length;
+    if (!Array.isArray(content)) return 0;
+    let total = 0;
+    for (const block of content) {{
+        if (typeof block === 'string') {{
+            total += block.length;
+            continue;
+        }}
+        if (!block || typeof block !== 'object') continue;
+        if (typeof block.text === 'string') total += block.text.length;
+        if (typeof block.input_text === 'string') total += block.input_text.length;
+    }}
+    return total;
+}}
+
+function estimatePromptChars(body) {{
+    if (!body || typeof body !== 'object') return 0;
+    let total = 0;
+    if (typeof body.system === 'string') total += body.system.length;
+    if (Array.isArray(body.system)) {{
+        for (const item of body.system) {{
+            if (typeof item === 'string') total += item.length;
+            if (item && typeof item === 'object' && typeof item.text === 'string') total += item.text.length;
+        }}
+    }}
+    if (Array.isArray(body.messages)) {{
+        for (const message of body.messages) {{
+            if (!message || typeof message !== 'object') continue;
+            total += extractMessageTextLength(message.content);
+        }}
+    }}
+    return total;
+}}
+
+function hasSystemPrompt(body) {{
+    if (!body || typeof body !== 'object') return false;
+    if (typeof body.system === 'string' && body.system.trim().length > 0) return true;
+    if (Array.isArray(body.system) && body.system.length > 0) return true;
+    if (!Array.isArray(body.messages)) return false;
+    for (const message of body.messages) {{
+        if (message?.role === 'system') return true;
+    }}
+    return false;
+}}
+
+function buildModelRouterFactors(requestedModel, body, sessionKeyHash) {{
+    const messagesCount = Array.isArray(body?.messages) ? body.messages.length : 0;
+    const toolsCount = Array.isArray(body?.tools) ? body.tools.length : 0;
+    const requested = typeof requestedModel === 'string' ? requestedModel : '';
+    const health = getModelHealth(modelHealthKey(sessionKeyHash, requested));
+    return {{
+        requested_model: requested || null,
+        messages_count: messagesCount,
+        tools_count: toolsCount,
+        has_thinking_signature: hasThinkingSignature(body),
+        has_system_prompt: hasSystemPrompt(body),
+        prompt_chars: estimatePromptChars(body),
+        failure_streak: health.failureStreak || 0,
+        success_streak: health.successStreak || 0
+    }};
+}}
+
+function evaluateModelRouterCondition(condition, factors) {{
+    const field = String(condition?.field || '').trim();
+    const op = String(condition?.op || '==').trim().toLowerCase();
+    const expected = condition?.value;
+    const actual = factors[field];
+    const hasField = Object.prototype.hasOwnProperty.call(factors, field);
+    let matched = false;
+    let reason = null;
+
+    if (!field) {{
+        return {{ field, op, expected, actual: null, matched: false, reason: 'missing_field_name' }};
+    }}
+
+    switch (op) {{
+        case 'exists':
+            matched = hasField && actual != null;
+            break;
+        case 'not_exists':
+            matched = !hasField || actual == null;
+            break;
+        case '==':
+            matched = hasField && scalarEquals(actual, expected);
+            break;
+        case '!=':
+            matched = !hasField || !scalarEquals(actual, expected);
+            break;
+        case '>':
+        case '>=':
+        case '<':
+        case '<=': {{
+            const left = toFiniteNumber(actual);
+            const right = toFiniteNumber(expected);
+            if (left == null || right == null) {{
+                matched = false;
+                reason = 'non_numeric_compare';
+                break;
+            }}
+            if (op === '>') matched = left > right;
+            if (op === '>=') matched = left >= right;
+            if (op === '<') matched = left < right;
+            if (op === '<=') matched = left <= right;
+            break;
+        }}
+        case 'in':
+        case 'not_in': {{
+            const values = Array.isArray(expected) ? expected : [expected];
+            const exists = values.some((item) => scalarEquals(actual, item));
+            matched = op === 'in' ? exists : !exists;
+            break;
+        }}
+        case 'contains':
+        case 'not_contains': {{
+            let exists = false;
+            if (Array.isArray(actual)) {{
+                exists = actual.some((item) => scalarEquals(item, expected));
+            }} else if (typeof actual === 'string') {{
+                exists = actual.includes(String(expected ?? ''));
+            }}
+            matched = op === 'contains' ? exists : !exists;
+            break;
+        }}
+        case 'regex': {{
+            if (typeof expected !== 'string') {{
+                matched = false;
+                reason = 'regex_pattern_not_string';
+                break;
+            }}
+            try {{
+                const regex = new RegExp(expected);
+                matched = regex.test(String(actual ?? ''));
+            }} catch (error) {{
+                matched = false;
+                reason = 'invalid_regex';
+            }}
+            break;
+        }}
+        default:
+            matched = false;
+            reason = 'unsupported_op';
+            break;
+    }}
+
+    return {{ field, op, expected, actual, matched, reason }};
+}}
+
+function evaluateModelRouterRule(rule, factors) {{
+    const conditions = Array.isArray(rule?.when) ? rule.when : [];
+    const mode = String(rule?.match || 'all').toLowerCase() === 'any' ? 'any' : 'all';
+
+    if (conditions.length === 0) {{
+        return {{
+            matched: true,
+            mode,
+            conditions: []
+        }};
+    }}
+
+    const conditionResults = conditions.map((condition) => evaluateModelRouterCondition(condition, factors));
+    const matched = mode === 'any'
+        ? conditionResults.some((item) => item.matched)
+        : conditionResults.every((item) => item.matched);
+
+    return {{
+        matched,
+        mode,
+        conditions: conditionResults
+    }};
+}}
+
+function resolveModelViaRouter(requestedModel, body, sessionKeyHash) {{
+    const requested = typeof requestedModel === 'string' ? requestedModel : '';
+    const config = MODEL_ROUTER_CONFIG && typeof MODEL_ROUTER_CONFIG === 'object'
+        ? MODEL_ROUTER_CONFIG
+        : null;
+
+    if (!config?.enabled) {{
+        return {{
+            enabled: false,
+            activated: false,
+            shadow_only: false,
+            decision: 'disabled',
+            requested_model: requested || null,
+            suggested_model: requested || null,
+            resolved_model: requested || null,
+            applied: false,
+            hit_rule: null,
+            factors: null,
+            eval_trace: null
+        }};
+    }}
+
+    const activationModels = Array.isArray(config.activation_models) ? config.activation_models : [];
+    if (activationModels.length > 0 && !activationModels.includes(requested)) {{
+        return {{
+            enabled: true,
+            activated: false,
+            shadow_only: config.shadow_only === true,
+            decision: 'not_activated',
+            requested_model: requested || null,
+            suggested_model: requested || null,
+            resolved_model: requested || null,
+            applied: false,
+            hit_rule: null,
+            factors: config.log_factors ? buildModelRouterFactors(requested, body, sessionKeyHash) : null,
+            eval_trace: null
+        }};
+    }}
+
+    const factors = buildModelRouterFactors(requested, body, sessionKeyHash);
+    const trace = [];
+    const rules = Array.isArray(config.rules) ? config.rules : [];
+    let hitRule = null;
+    let suggestedModel = requested;
+    let decision = 'no_rule';
+
+    for (const rule of rules) {{
+        const targetModel = String(rule?.target_model || '').trim();
+        const ruleName = String(rule?.name || 'unnamed_rule');
+        const priority = Number(rule?.priority || 0);
+
+        if (!targetModel) {{
+            trace.push({{
+                rule: ruleName,
+                priority,
+                matched: false,
+                skipped: 'missing_target_model'
+            }});
+            continue;
+        }}
+        if (!ROUTES[targetModel]) {{
+            trace.push({{
+                rule: ruleName,
+                priority,
+                matched: false,
+                skipped: 'target_model_not_found',
+                target_model: targetModel
+            }});
+            continue;
+        }}
+
+        const result = evaluateModelRouterRule(rule, factors);
+        trace.push({{
+            rule: ruleName,
+            priority,
+            target_model: targetModel,
+            match_mode: result.mode,
+            matched: result.matched,
+            conditions: result.conditions
+        }});
+
+        if (result.matched) {{
+            hitRule = {{
+                name: ruleName,
+                priority,
+                target_model: targetModel,
+                match: String(rule?.match || 'all')
+            }};
+            suggestedModel = targetModel;
+            decision = `rule_hit_${{ruleName}}`;
+            break;
+        }}
+    }}
+
+    if (!hitRule) {{
+        const defaultModel = String(config.default_model || '').trim();
+        if (defaultModel) {{
+            if (ROUTES[defaultModel]) {{
+                suggestedModel = defaultModel;
+                decision = 'default_model';
+            }} else {{
+                decision = 'default_model_not_found';
+                trace.push({{
+                    rule: '__default_model__',
+                    matched: false,
+                    skipped: 'default_model_not_found',
+                    target_model: defaultModel
+                }});
+            }}
+        }}
+    }}
+
+    const shadowOnly = config.shadow_only === true;
+    const applied = !shadowOnly && suggestedModel !== requested;
+    const resolvedModel = applied ? suggestedModel : requested;
+
+    return {{
+        enabled: true,
+        activated: true,
+        shadow_only: shadowOnly,
+        decision,
+        requested_model: requested || null,
+        suggested_model: suggestedModel || null,
+        resolved_model: resolvedModel || null,
+        applied,
+        hit_rule: hitRule,
+        factors: config.log_factors ? factors : null,
+        eval_trace: config.log_factors ? trace : null
+    }};
+}}
 
 // 从 SSE 流中提取 usage 信息
 function extractUsageFromSSE(chunks) {{
@@ -798,12 +1287,17 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             }},
             routing: {{
                 requested_model: req._requestedModel || null,
+                resolved_model: req._resolvedModel || req._model || null,
                 source_model: req._sourceModel || null,
                 target_instance: req._targetInstance || null,
                 target_url: req._targetUrl || null,
                 rewritten_model: req._rewrittenModel || null,
                 provider: req._targetProvider || null,
                 target_params: req._targetParamSummary || null,
+                hit_rule: req._modelRouter?.hit_rule || null,
+                factors: req._modelRouter?.factors || null,
+                eval_trace: req._modelRouter?.eval_trace || null,
+                model_router: req._modelRouter || null,
                 auto_upgrade: req._autoUpgrade || null,
                 model_health: req._modelHealth || null,
                 decision: req._routingDecision || null,
@@ -1070,9 +1564,18 @@ const server = http.createServer((req, res) => {{
             req._retryTrace = [];
             req._targetParamSummary = null;
             req._autoUpgrade = null;
+            req._modelRouter = null;
+            req._resolvedModel = model;
             const sessionKey = getSessionKey(req, jsonBody);
             req._sessionKeyHash = hashSessionKey(sessionKey);
             req._modelHealthKey = modelHealthKey(req._sessionKeyHash, req._sourceModel);
+
+            const modelRouter = resolveModelViaRouter(model, jsonBody, req._sessionKeyHash);
+            req._modelRouter = modelRouter;
+            if (modelRouter?.enabled && modelRouter?.activated && modelRouter?.applied && modelRouter?.resolved_model) {{
+                model = modelRouter.resolved_model;
+                req._model = model;
+            }}
 
             const autoUpgrade = resolveAutoUpgradeModel(model, jsonBody, req._sessionKeyHash);
             if (autoUpgrade) {{
@@ -1080,6 +1583,7 @@ const server = http.createServer((req, res) => {{
                 req._model = model;
                 req._autoUpgrade = autoUpgrade;
             }}
+            req._resolvedModel = model;
 
             const route = ROUTES[model];
             if (!route) {{
@@ -1093,6 +1597,10 @@ const server = http.createServer((req, res) => {{
             let routingDecision = 'weighted_random';
             if (req._autoUpgrade) {{
                 routingDecision = `auto_upgrade_${{req._autoUpgrade.sourceModel}}_to_${{req._autoUpgrade.targetModel}}`;
+            }} else if (req._modelRouter?.enabled && req._modelRouter?.activated) {{
+                routingDecision = req._modelRouter.applied
+                    ? `model_router_${{req._modelRouter.decision || 'resolved'}}`
+                    : `model_router_${{req._modelRouter.decision || 'passthrough'}}`;
             }}
 
             if (req._hasThinkingSignature) {{
@@ -1163,4 +1671,3 @@ server.listen(PORT);
     with open(path, "w") as f:
         f.write(script_content)
     print(f"✅ 生成 Node.js LB 脚本 (含日志): {path}")
-

@@ -38,6 +38,35 @@ lb_auto_upgrade_signature_enabled = true
 "g3f.auto" = "opus4.6"
 ```
 
+配置驱动选模（可选，默认关闭）：
+
+```toml
+[global.lb_model_router]
+enabled = false
+shadow_only = false
+activation_models = ["auto"]   # 仅当请求 model 命中该列表时触发
+default_model = "g3f"          # 无规则命中时兜底模型
+log_factors = true             # 是否在日志写入 factors/eval_trace
+# config_file = "router/agent-model-router.toml"  # 可选外部规则文件
+
+[[global.lb_model_router.rules]]
+name = "high_complexity"
+priority = 300
+target_model = "opus4.6"
+match = "any"                  # any / all
+
+[[global.lb_model_router.rules.when]]
+field = "messages_count"
+op = ">="
+value = 40
+```
+
+- `shadow_only = true`：只记录“建议模型”，不改写实际路由
+- `config_file`：支持相对路径（相对 `generate_config.py` 所在目录）或绝对路径
+- 规则按 `priority` 降序评估，命中即停止
+- 支持条件操作符：`== != > >= < <= in not_in contains not_contains exists not_exists regex`
+- 可用因子字段：`requested_model`、`messages_count`、`tools_count`、`has_thinking_signature`、`has_system_prompt`、`prompt_chars`、`failure_streak`、`success_streak`
+
 ## 2. 物理实例
 
 ```toml

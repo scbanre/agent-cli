@@ -1,1 +1,159 @@
-../providers.toml
+# cliProxyAPI 聚合网关配置 (物理实例 + 逻辑路由)
+
+[global]
+host = "0.0.0.0"
+main_port = 8145                 # 主聚合端口
+proxy = "http://127.0.0.1:10808"
+request_retry = 3                # 实例内自动重试（403/5xx 等）
+max_retry_interval = 30          # 最长等待冷却秒数
+nonstream_keepalive_interval = 5 # 非流式保活（秒），减少长请求超时误判
+streaming_keepalive_seconds = 15 # SSE 心跳（秒）
+streaming_bootstrap_retries = 1  # 流式首包前安全重试
+quota_switch_project = true      # 配额超限时自动切换账号/项目
+quota_switch_preview_model = true # 配额超限时可自动切 preview 模型
+lb_auth_cooldown_ms = 1800000    # LB 认证类错误冷却 30 分钟
+lb_validation_cooldown_ms = 43200000 # LB 验证类 403 冷却 12 小时
+lb_quota_cooldown_ms = 43200000  # LB 配额类错误冷却 12 小时
+lb_max_target_retries = 1        # LB 首包前最多自动切换重试次数
+lb_auto_upgrade_enabled = true
+lb_auto_upgrade_messages_threshold = 80
+lb_auto_upgrade_tools_threshold = 10
+lb_auto_upgrade_failure_streak_threshold = 2
+lb_auto_upgrade_signature_enabled = true
+
+[global.lb_auto_upgrade_map]
+"g3f.auto" = "opus4.6"
+"g3p.auto" = "opus4.6"
+
+[global.lb_model_router]
+enabled = true
+shadow_only = true
+activation_models = ["auto", "auto-canary"]
+default_model = "g3f"
+log_factors = true
+# config_file = "router/agent-model-router.toml"
+
+[[global.lb_model_router.rules]]
+name = "high_complexity"
+priority = 300
+target_model = "opus4.6"
+match = "any"
+
+[[global.lb_model_router.rules.when]]
+field = "messages_count"
+op = ">="
+value = 40
+
+[[global.lb_model_router.rules.when]]
+field = "tools_count"
+op = ">="
+value = 8
+
+[[global.lb_model_router.rules]]
+name = "medium_complexity"
+priority = 200
+target_model = "g3p.auto"
+match = "any"
+
+[[global.lb_model_router.rules.when]]
+field = "messages_count"
+op = ">="
+value = 18
+
+[[global.lb_model_router.rules.when]]
+field = "tools_count"
+op = ">="
+value = 3
+
+# ==========================================
+# 1. 物理实例定义 (Instances)
+#    每个 [instances.name] 对应一个独立进程
+# ==========================================
+
+# --- 实例 A: Official (官方原生 Auth 聚合) ---
+# 包含 Antigravity (Google) 和 OpenAI (Codex/ChatGPT)
+# 均使用 OAuth 登录，无需在此填 Key
+[instances.official]
+port = 8146
+request_retry = 1
+max_retry_interval = 5
+providers = [
+  # 1. Antigravity (Google OAuth)
+  # 需运行: ./cliproxy --antigravity-login
+  { type = "antigravity", rotation_strategy = "round-robin" },
+
+  # 2. OpenAI Official (Codex/ChatGPT OAuth)
+  # 需运行: ./cliproxy --codex-login
+  { type = "codex", rotation_strategy = "round-robin" },
+
+  { type = "minimax", base_url = "https://api.minimaxi.com/anthropic", api_keys = [
+    "${MINIMAX_KEY}",
+  ] },
+]
+
+# --- 实例 B: Zenmux (聚合渠道 - API Key) ---
+[instances.zenmux]
+port = 8147
+disable_cooling = true
+request_retry = 2
+max_retry_interval = 15
+providers = [
+  # Endpoint 1: OpenAI 兼容 (GPT, DeepSeek, Kimi)
+  { type = "openai", base_url = "https://zenmux.ai/api/v1", api_keys = [
+    "${ZENMUX_KEY}",
+  ] },
+  # Endpoint 2: Anthropic 兼容 (Claude)
+  { type = "anthropic", base_url = "https://zenmux.ai/api/anthropic", api_keys = [
+    "${ZENMUX_KEY}",
+  ] },
+  # Endpoint 3: Vertex AI 兼容 (Gemini)
+  { type = "gemini", base_url = "https://zenmux.ai/api/vertex-ai", api_keys = [
+    "${ZENMUX_KEY}",
+  ] },
+]
+
+# ==========================================
+# 2. 聚合路由与映射 (Routing)
+#    定义主网关对外暴露的模型，以及分发策略
+#    格式: "对外ID" = [ { instance="实例名", provider="逻辑Provider类型", model="内部映射名", weight=权重 }, ... ]
+# ==========================================
+
+[routing]
+
+"opus4.6" = [
+  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "max_tokens_max" = 24000 } },
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "max_tokens_max" = 24000 } },
+]
+
+"M2.5" = [
+  { instance = "official", provider = "minimax", model = "MiniMax-M2.5", weight = 80 },
+]
+
+"g3f" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
+]
+
+"g3f.auto" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
+]
+
+"g3p.auto" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
+  { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "max_tokens_max" = 16000 } },
+]
+
+"g3i" = [
+  { instance = "official", provider = "antigravity", model = "gemini-3-pro-image", weight = 999 },
+  { instance = "zenmux", provider = "gemini", model = "google/gemini-3-pro-image-preview", weight = 1 },
+]
+
+"gpt5.3" = [
+  { instance = "official", provider = "codex", model = "gpt-5.3-codex", weight = 1, params = { "reasoning_effort" = "high" } },
+]
+
+"gpt5.2" = [
+  { instance = "official", provider = "codex", model = "gpt-5.2", weight = 80, params = { "reasoning_effort" = "high" } },
+  { instance = "zenmux", provider = "openai", model = "openai/gpt-5.2", weight = 20, params = { "reasoning_effort" = "high" } },
+]
