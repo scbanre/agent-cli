@@ -14,10 +14,66 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-LOGS_DIR = BASE_DIR / "logs" / "requests"
-CACHE_DIR = BASE_DIR / "logs" / "stats_cache"
-TOML_FILE = BASE_DIR / "providers.toml"
+
+def _score_base_dir(path: Path) -> int:
+    """Heuristic score for choosing runtime base directory."""
+    score = 0
+    if (path / "providers.toml").exists():
+        score += 3
+    req_dir = path / "logs" / "requests"
+    if req_dir.exists():
+        score += 2
+        if any(req_dir.glob("*.jsonl")):
+            score += 3
+    if (path / "instances").exists():
+        score += 1
+    return score
+
+
+def _resolve_base_dir(cli_base_dir: str = "") -> Path:
+    script_base = Path(__file__).resolve().parent.parent
+    candidates = []
+
+    if cli_base_dir:
+        candidates.append(Path(cli_base_dir).expanduser())
+
+    env_base = os.environ.get("CLIPROXY_BASE_DIR")
+    if env_base:
+        candidates.append(Path(env_base).expanduser())
+
+    candidates.append(Path.cwd())
+    candidates.append(script_base)
+    candidates.append(script_base.parent)
+
+    # Pick the highest-scoring existing directory.
+    best = script_base
+    best_score = -1
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            continue
+        if resolved in seen or not resolved.exists() or not resolved.is_dir():
+            continue
+        seen.add(resolved)
+        score = _score_base_dir(resolved)
+        if score > best_score:
+            best_score = score
+            best = resolved
+    return best
+
+
+def _apply_base_dir(base_dir: Path) -> None:
+    global BASE_DIR, LOGS_DIR, CACHE_DIR, TOML_FILE, _PROVIDER_MAP
+    BASE_DIR = base_dir
+    LOGS_DIR = BASE_DIR / "logs" / "requests"
+    CACHE_DIR = BASE_DIR / "logs" / "stats_cache"
+    TOML_FILE = BASE_DIR / "providers.toml"
+    _PROVIDER_MAP = None
+
+
+_apply_base_dir(_resolve_base_dir())
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
@@ -303,11 +359,18 @@ def resolve_days(args) -> list[date]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="cliproxyapi usage statistics")
+    parser.add_argument(
+        "--base-dir",
+        default="",
+        help="Runtime base dir for logs/providers (default: auto-detect; CLI > CLIPROXY_BASE_DIR > heuristic)",
+    )
     parser.add_argument("--days", type=int, default=7, help="Number of recent days (default: 7)")
     parser.add_argument("--all", action="store_true", help="Process all available log files")
     parser.add_argument("--force", action="store_true", help="Ignore cache, recompute everything")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output JSON instead of table")
     args = parser.parse_args()
+
+    _apply_base_dir(_resolve_base_dir(args.base_dir))
 
     days = resolve_days(args)
     if not days:

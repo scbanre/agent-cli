@@ -47,14 +47,68 @@ _set_title() {
 }
 
 # 获取可用模型列表
-# 优先从 CLD_TOML 环境变量指定的 TOML 文件读取，否则返回内置列表
+# 优先从 CLD_TOML 环境变量指定的 TOML 文件读取；未指定时自动探测 providers.toml
 # 内置列表由 deploy_cld.sh 在部署时从 providers.toml 烘焙
+_resolve_toml_file() {
+  local env_toml="${CLD_TOML:-}"
+  if [[ -n "$env_toml" && -f "$env_toml" ]]; then
+    echo "$env_toml"
+    return 0
+  fi
+
+  local -a candidates=()
+  local src_path=""
+
+  # zsh autoload/function 场景：优先从函数来源路径探测
+  if [[ -n "${funcfiletrace[1]:-}" ]]; then
+    src_path="${funcfiletrace[1]%:*}"
+    if [[ -n "$src_path" ]]; then
+      candidates+=(
+        "${src_path:A:h}/providers.toml"
+        "${src_path:A:h}/../providers.toml"
+      )
+    fi
+  fi
+
+  # 直接执行脚本场景
+  if [[ -n "${0:-}" && "${0}" != "zsh" && "${0}" != "-zsh" ]]; then
+    candidates+=("${0:A:h}/providers.toml")
+  fi
+
+  # 常见工作目录/部署目录
+  candidates+=(
+    "$PWD/providers.toml"
+    "$PWD/../providers.toml"
+    "/Volumes/ext/env/cliproxyapi/providers.toml"
+  )
+
+  local path=""
+  for path in "${candidates[@]}"; do
+    if [[ -f "$path" ]]; then
+      echo "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 _get_proxy_models() {
-  # 如果指定了 TOML 文件，动态解析
-  local toml="${CLD_TOML:-}"
+  local toml="$(_resolve_toml_file 2>/dev/null || true)"
   if [[ -n "$toml" && -f "$toml" ]]; then
     local models
-    models=$(sed -n '/^\[routing\]/,/^\[.*\]/p' "$toml" | grep '^[[:space:]]*"' | cut -d'"' -f2)
+    models=$(awk '
+      /^\[routing\][[:space:]]*$/ { in_routing = 1; next }
+      /^\[[^]]+\][[:space:]]*$/ {
+        if (in_routing) exit
+      }
+      in_routing && $0 ~ /^[[:space:]]*"/ {
+        line = $0
+        sub(/^[[:space:]]*"/, "", line)
+        sub(/".*$/, "", line)
+        print line
+      }
+    ' "$toml")
     if [[ -n "$models" ]]; then
       echo "$models"
       return
@@ -63,8 +117,10 @@ _get_proxy_models() {
 
   # --- BEGIN MODELS ---
   echo "opus4.6"
-  echo "g3p"
+  echo "M2.5"
   echo "g3f"
+  echo "g3f.auto"
+  echo "g3p.auto"
   echo "g3i"
   echo "gpt5.3"
   echo "gpt5.2"
