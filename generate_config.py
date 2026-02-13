@@ -205,6 +205,7 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
     transient_cooldown_ms = int(global_conf.get("lb_transient_cooldown_ms", 60 * 1000))
     transient_heavy_cooldown_ms = int(global_conf.get("lb_transient_heavy_cooldown_ms", 2 * 60 * 1000))
     signature_cooldown_ms = int(global_conf.get("lb_signature_cooldown_ms", 2 * 60 * 1000))
+    quota_cooldown_ms = int(global_conf.get("lb_quota_cooldown_ms", 12 * 60 * 60 * 1000))
     max_target_retries = max(0, int(global_conf.get("lb_max_target_retries", 1)))
 
     script_content = f"""
@@ -230,6 +231,7 @@ const VALIDATION_COOLDOWN_MS = {validation_cooldown_ms};
 const TRANSIENT_COOLDOWN_MS = {transient_cooldown_ms};
 const TRANSIENT_HEAVY_COOLDOWN_MS = {transient_heavy_cooldown_ms};
 const SIGNATURE_COOLDOWN_MS = {signature_cooldown_ms};
+const QUOTA_COOLDOWN_MS = {quota_cooldown_ms};
 const MAX_TARGET_RETRIES = {max_target_retries};
 const RETRYABLE_ROUTE_ACTIONS = new Set(['auth', 'transient']);
 const stickyRoutes = new Map();
@@ -355,11 +357,18 @@ function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {
         (summary.includes('validation_required') ||
          summary.includes('verify your account') ||
          summary.includes('validation_url'));
+    const isQuotaError = summary.includes('insufficient_quota') ||
+        summary.includes('quota exceeded');
     const isAuthError = summary.includes('auth_unavailable') ||
         summary.includes('auth_not_found') ||
         statusCode === 401 || statusCode === 403;
     if (isAuthError) {{
-        const cooldownMs = isValidationError ? VALIDATION_COOLDOWN_MS : AUTH_COOLDOWN_MS;
+        let cooldownMs = AUTH_COOLDOWN_MS;
+        if (isValidationError) {{
+            cooldownMs = VALIDATION_COOLDOWN_MS;
+        }} else if (isQuotaError) {{
+            cooldownMs = QUOTA_COOLDOWN_MS;
+        }}
         return {{ kind: 'auth', clearSticky: true, cooldownMs }};
     }}
 
@@ -437,6 +446,39 @@ function summarizeRequestBody(body) {{
         }}
     }}
     return summary;
+}}
+
+function shouldNormalizeErrorMessage(message) {{
+    if (typeof message !== 'string' || message.length === 0) return false;
+    const hasGzipMagic = message.length >= 2 &&
+        message.charCodeAt(0) === 0x1f &&
+        message.charCodeAt(1) === 0x8b;
+    const controlChars = (message.match(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F]/g) || []).length;
+    const replacementChars = (message.match(/\\uFFFD/g) || []).length;
+    return hasGzipMagic || controlChars >= 3 || replacementChars >= 3;
+}}
+
+function maybeNormalizeJsonErrorBody(contentType, responseBody) {{
+    if (!contentType.includes('application/json') || typeof responseBody !== 'string') {{
+        return responseBody;
+    }}
+    try {{
+        const payload = JSON.parse(responseBody);
+        if (!payload?.error || typeof payload.error !== 'object') {{
+            return responseBody;
+        }}
+        const message = payload.error.message;
+        if (!shouldNormalizeErrorMessage(message)) {{
+            return responseBody;
+        }}
+        const code = typeof payload.error.code === 'string' ? payload.error.code : null;
+        payload.error.message = code === 'insufficient_quota'
+            ? 'upstream quota exhausted; please switch account/key or wait for quota reset'
+            : 'upstream returned unreadable compressed error details';
+        return JSON.stringify(payload);
+    }} catch (e) {{
+        return responseBody;
+    }}
 }}
 
 function targetIdentity(target) {{
@@ -628,10 +670,14 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
         if (isSSE) {{
             res.end();
         }} else {{
+            const clientBody = maybeNormalizeJsonErrorBody(contentType, responseBody);
+            const responseHeaders = {{ ...proxyRes.headers }};
+            delete responseHeaders['content-length'];
+            delete responseHeaders['Content-Length'];
             if (!res.headersSent) {{
-                res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                res.writeHead(proxyRes.statusCode, responseHeaders);
             }}
-            res.end(responseBody);
+            res.end(clientBody);
         }}
 
         // 构建日志条目
@@ -662,7 +708,7 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             response: {{
                 status_code: proxyRes.statusCode,
                 headers: proxyRes.headers,
-                body_length: responseBody.length,
+                body_length: Buffer.byteLength(responseBody, 'utf8'),
                 body_preview: responsePreview,
                 route_action: req._routeAction || null,
                 cooldown_ms_applied: req._cooldownMsApplied || 0
