@@ -300,6 +300,7 @@ def create_node_lb_script(path, routing, instances, port, global_conf):
     signature_cooldown_ms = int(global_conf.get("lb_signature_cooldown_ms", 2 * 60 * 1000))
     quota_cooldown_ms = int(global_conf.get("lb_quota_cooldown_ms", 12 * 60 * 60 * 1000))
     max_target_retries = max(0, int(global_conf.get("lb_max_target_retries", 1)))
+    retry_auth_on_5xx = coerce_bool(global_conf.get("lb_retry_auth_on_5xx", True))
     auto_upgrade_enabled = coerce_bool(global_conf.get("lb_auto_upgrade_enabled", False))
     auto_upgrade_messages_threshold = max(1, coerce_int(global_conf.get("lb_auto_upgrade_messages_threshold", 80)))
     auto_upgrade_tools_threshold = max(1, coerce_int(global_conf.get("lb_auto_upgrade_tools_threshold", 10)))
@@ -320,6 +321,7 @@ const httpProxy = require('http-proxy');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 
 const PORT = {port};
 const ROUTES = {json.dumps(routes, indent=2)};
@@ -339,6 +341,7 @@ const TRANSIENT_HEAVY_COOLDOWN_MS = {transient_heavy_cooldown_ms};
 const SIGNATURE_COOLDOWN_MS = {signature_cooldown_ms};
 const QUOTA_COOLDOWN_MS = {quota_cooldown_ms};
 const MAX_TARGET_RETRIES = {max_target_retries};
+const RETRY_AUTH_ON_5XX = {str(retry_auth_on_5xx).lower()};
 const AUTO_UPGRADE_ENABLED = {str(auto_upgrade_enabled).lower()};
 const AUTO_UPGRADE_MODEL_MAP = {json.dumps(auto_upgrade_map, indent=2)};
 const AUTO_UPGRADE_MESSAGES_THRESHOLD = {auto_upgrade_messages_threshold};
@@ -445,6 +448,66 @@ function extractUsageFromJSON(body) {{
     }}
 }}
 
+function decodeResponseBody(rawBodyBuffer, proxyHeaders) {{
+    if (!Buffer.isBuffer(rawBodyBuffer) || rawBodyBuffer.length === 0) {{
+        return {{
+            bodyText: '',
+            decodedFromEncoding: null,
+            decodeError: null
+        }};
+    }}
+
+    const headerValue = proxyHeaders?.['content-encoding'] ?? proxyHeaders?.['Content-Encoding'] ?? '';
+    const encoding = String(headerValue || '')
+        .split(',')
+        .map((part) => part.trim().toLowerCase())
+        .find((part) => part.length > 0) || '';
+
+    if (!encoding) {{
+        return {{
+            bodyText: rawBodyBuffer.toString('utf-8'),
+            decodedFromEncoding: null,
+            decodeError: null
+        }};
+    }}
+
+    try {{
+        if (encoding === 'gzip' || encoding === 'x-gzip') {{
+            return {{
+                bodyText: zlib.gunzipSync(rawBodyBuffer).toString('utf-8'),
+                decodedFromEncoding: encoding,
+                decodeError: null
+            }};
+        }}
+        if (encoding === 'br') {{
+            return {{
+                bodyText: zlib.brotliDecompressSync(rawBodyBuffer).toString('utf-8'),
+                decodedFromEncoding: encoding,
+                decodeError: null
+            }};
+        }}
+        if (encoding === 'deflate') {{
+            return {{
+                bodyText: zlib.inflateSync(rawBodyBuffer).toString('utf-8'),
+                decodedFromEncoding: encoding,
+                decodeError: null
+            }};
+        }}
+    }} catch (error) {{
+        return {{
+            bodyText: rawBodyBuffer.toString('utf-8'),
+            decodedFromEncoding: null,
+            decodeError: error?.message || 'decode_failed'
+        }};
+    }}
+
+    return {{
+        bodyText: rawBodyBuffer.toString('utf-8'),
+        decodedFromEncoding: null,
+        decodeError: null
+    }};
+}}
+
 function parseErrorSummary(contentType, body) {{
     const segments = [];
     if (contentType.includes('application/json')) {{
@@ -484,7 +547,11 @@ function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {
          summary.includes('verify your account') ||
          summary.includes('validation_url'));
     const isQuotaError = summary.includes('insufficient_quota') ||
-        summary.includes('quota exceeded');
+        summary.includes('quota exceeded') ||
+        summary.includes('quote_exceeded') ||
+        summary.includes('subscription quota') ||
+        summary.includes('quota limit') ||
+        summary.includes('quota refresh');
     const isAuthError = summary.includes('auth_unavailable') ||
         summary.includes('auth_not_found') ||
         statusCode === 401 || statusCode === 403;
@@ -851,7 +918,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
 
     proxyRes.on('end', () => {{
         const duration = Date.now() - startTime;
-        const responseBody = Buffer.concat(chunks).toString('utf-8');
+        const rawResponseBodyBuffer = Buffer.concat(chunks);
+        const decodedResponse = decodeResponseBody(rawResponseBodyBuffer, proxyRes.headers);
+        const responseBody = decodedResponse.bodyText;
         const responsePreview = responseBody.length > RESPONSE_PREVIEW_LIMIT
             ? responseBody.slice(0, RESPONSE_PREVIEW_LIMIT) + '...[truncated]'
             : responseBody;
@@ -890,6 +959,10 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             req.method === 'POST' &&
             (req._retryCount || 0) < MAX_TARGET_RETRIES &&
             RETRYABLE_ROUTE_ACTIONS.has(routeAction.kind) &&
+            (routeAction.kind !== 'auth' ||
+                proxyRes.statusCode === 401 ||
+                proxyRes.statusCode === 403 ||
+                (RETRY_AUTH_ON_5XX && (proxyRes.statusCode || 0) >= 500)) &&
             !res.headersSent;
         if (canRetry) {{
             const retryTarget = pickRetryTarget(req);
@@ -931,6 +1004,10 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             const responseHeaders = {{ ...proxyRes.headers }};
             delete responseHeaders['content-length'];
             delete responseHeaders['Content-Length'];
+            if (decodedResponse.decodedFromEncoding) {{
+                delete responseHeaders['content-encoding'];
+                delete responseHeaders['Content-Encoding'];
+            }}
             if (!res.headersSent) {{
                 res.writeHead(proxyRes.statusCode, responseHeaders);
             }}
@@ -970,10 +1047,12 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             response: {{
                 status_code: proxyRes.statusCode,
                 headers: proxyRes.headers,
-                body_length: Buffer.byteLength(responseBody, 'utf8'),
+                body_length: rawResponseBodyBuffer.length,
                 body_preview: responsePreview,
                 route_action: req._routeAction || null,
-                cooldown_ms_applied: req._cooldownMsApplied || 0
+                cooldown_ms_applied: req._cooldownMsApplied || 0,
+                decoded_content_encoding: decodedResponse.decodedFromEncoding || null,
+                decode_error: decodedResponse.decodeError || null
             }},
             usage: usage
         }};

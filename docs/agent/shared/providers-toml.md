@@ -17,6 +17,7 @@ streaming_bootstrap_retries = 1
 quota_switch_project = true
 quota_switch_preview_model = true
 lb_auto_upgrade_enabled = true
+lb_retry_auth_on_5xx = false
 lb_auto_upgrade_messages_threshold = 80
 lb_auto_upgrade_tools_threshold = 10
 lb_auto_upgrade_failure_streak_threshold = 2
@@ -27,6 +28,7 @@ lb_auto_upgrade_signature_enabled = true
 - `nonstream_keepalive_interval`: 非流式请求保活间隔（秒）
 - `streaming_keepalive_seconds` / `streaming_bootstrap_retries`: 流式心跳与首包前安全重试
 - `quota_switch_project` / `quota_switch_preview_model`: 配额超限时的自动切换策略
+- `lb_retry_auth_on_5xx`: 是否允许认证类 5xx 在 LB 层跨后端重试（默认关闭，避免 `auth_unavailable` 循环）
 - `lb_auto_upgrade_*`: LB 自动升档阈值开关（按请求复杂度与失败连击）
 
 可选模型升档映射（常用于 `g3f.auto -> opus4.6`）：

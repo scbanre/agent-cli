@@ -129,6 +129,7 @@ pm2 logs                     # 查看日志
 - Claude 1M context 建议通过路由 `params.anthropic_beta` 配置（可选，默认不加）
 - 如需注入其他请求头，可使用 `params.extra_headers`（按路由目标生效）
 - `providers.toml` 支持实例级 `request_retry/max_retry_interval` 与全局 `streaming_*` / `quota_switch_*` 透传到 cliproxy 配置
+- 当出现认证 5xx 风暴时，可用 `global.lb_retry_auth_on_5xx = false` 禁止 LB 在认证类 5xx 上跨后端重试
 
 ## 详细文档
 
