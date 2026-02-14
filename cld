@@ -180,6 +180,7 @@ local -a envs=()
 envs+=(
   "HTTP_PROXY=" "HTTPS_PROXY=" "ALL_PROXY="
   "ANTHROPIC_AUTH_TOKEN="
+  "ANTHROPIC_API_KEY="
 )
 
 # 2. 模式逻辑
