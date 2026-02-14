@@ -1656,7 +1656,64 @@ const server = http.createServer((req, res) => {{
             forwardRequestToTarget(req, res, selected, routingDecision);
         }});
     }} else {{
-        proxy.web(req, res, {{ target: DEFAULT_TARGET }});
+        // 非 POST 请求（如 GET）也记录日志
+        proxy.web(req, res, {{
+            target: DEFAULT_TARGET
+        }}, (err, req, res, payload) => {{
+            if (err) {{
+                console.error('Proxy error:', err.message);
+                return;
+            }}
+            // 记录请求日志
+            const logEntry = {{
+                timestamp: new Date().toISOString(),
+                duration_ms: Date.now() - (req._startTime || Date.now()),
+                request: {{
+                    method: req.method,
+                    url: req.url,
+                    headers: sanitizeHeaders(req.headers),
+                    body: null,
+                    model: null,
+                    client_ip: req._clientIp
+                }},
+                routing: {{
+                    requested_model: null,
+                    resolved_model: null,
+                    source_model: null,
+                    target_instance: null,
+                    target_url: DEFAULT_TARGET,
+                    rewritten_model: null,
+                    provider: null,
+                    target_params: null,
+                    hit_rule: null,
+                    factors: null,
+                    eval_trace: null,
+                    model_router: null,
+                    auto_upgrade: null,
+                    model_health: null,
+                    decision: 'direct',
+                    session_key_hash: null,
+                    has_thinking_signature: false,
+                    sticky_action: 'none',
+                    retry_count: 0,
+                    tried_targets: [],
+                    retry_attempts: 0,
+                    retry_trace: []
+                }},
+                response: {{
+                    status_code: res.statusCode || 0,
+                    headers: res.headers || {{}},
+                    body_length: payload ? payload.length : 0,
+                    body_preview: payload ? payload.toString().slice(0, 200) : null,
+                    route_action: 'direct',
+                    cooldown_ms_applied: 0,
+                    decoded_content_encoding: null,
+                    decode_error: null
+                }},
+                usage: null
+            }};
+            writeLog(logEntry);
+        }});
     }}
 }});
 

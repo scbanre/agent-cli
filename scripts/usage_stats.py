@@ -189,13 +189,14 @@ def process_day(day: date) -> dict:
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
     by_instance: dict[str, dict] = defaultdict(_empty_bucket)
     by_provider: dict[str, dict] = defaultdict(_empty_bucket)
+    by_client_ip: dict[str, dict] = defaultdict(_empty_bucket)
     total = _empty_bucket()
     decisions: dict[str, int] = defaultdict(int)
     sticky_keys: set[str] = set()
 
     if not path.exists():
         return {"date": day.isoformat(), "by_model": {}, "by_instance": {}, "by_provider": {},
-                "total": total, "routing": {"decisions": {}, "sticky_keys": 0}}
+                "by_client_ip": {}, "total": total, "routing": {"decisions": {}, "sticky_keys": 0}}
 
     with open(path) as f:
         for line in f:
@@ -220,6 +221,9 @@ def process_day(day: date) -> dict:
                 routing.get("rewritten_model"), routing.get("requested_model") or model
             )
 
+            # Get client IP
+            client_ip = rec["request"].get("client_ip") or "unknown"
+
             decision = routing.get("decision") or "(none)"
             decisions[decision] += 1
             sk = routing.get("session_key_hash")
@@ -229,6 +233,7 @@ def process_day(day: date) -> dict:
             _add(by_model[model], rec)
             _add(by_instance[instance], rec)
             _add(by_provider[f"{model} @ {provider} / {instance}"], rec)
+            _add(by_client_ip[client_ip], rec)
             _add(total, rec)
 
     return {
@@ -236,6 +241,7 @@ def process_day(day: date) -> dict:
         "by_model": dict(by_model),
         "by_instance": dict(by_instance),
         "by_provider": dict(by_provider),
+        "by_client_ip": dict(by_client_ip),
         "total": total,
         "routing": {"decisions": dict(decisions), "sticky_keys": len(sticky_keys)},
     }
@@ -279,6 +285,7 @@ def aggregate(day_stats_list: list[dict]) -> dict:
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
     by_instance: dict[str, dict] = defaultdict(_empty_bucket)
     by_provider: dict[str, dict] = defaultdict(_empty_bucket)
+    by_client_ip: dict[str, dict] = defaultdict(_empty_bucket)
     total = _empty_bucket()
     decisions: dict[str, int] = defaultdict(int)
     sticky_keys = 0
@@ -291,6 +298,8 @@ def aggregate(day_stats_list: list[dict]) -> dict:
             _merge(by_instance[name], bucket)
         for name, bucket in ds.get("by_provider", {}).items():
             _merge(by_provider[name], bucket)
+        for name, bucket in ds.get("by_client_ip", {}).items():
+            _merge(by_client_ip[name], bucket)
         rt = ds.get("routing") or {}
         for d, cnt in rt.get("decisions", {}).items():
             decisions[d] += cnt
@@ -300,6 +309,7 @@ def aggregate(day_stats_list: list[dict]) -> dict:
         "by_model": dict(by_model),
         "by_instance": dict(by_instance),
         "by_provider": dict(by_provider),
+        "by_client_ip": dict(by_client_ip),
         "total": total,
         "routing": {"decisions": dict(decisions), "sticky_keys": sticky_keys},
     }
@@ -344,6 +354,14 @@ def print_human(agg: dict, start: date, end: date) -> None:
         f"Sticky keys: {fmt_num(rt.get('sticky_keys', 0))}"
     )
     print()
+
+    # 按客户端 IP 统计
+    by_client_ip = agg.get("by_client_ip", {})
+    if by_client_ip:
+        print("--- By Client IP ---")
+        print_table(by_client_ip, "Client IP")
+        print()
+
     print_table(agg["by_provider"], "Model @ Provider / Instance")
 
 
