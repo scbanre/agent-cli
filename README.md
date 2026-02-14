@@ -74,32 +74,38 @@ cld official           # 官方模式
 ## 快速开始
 
 ```bash
-# 1. 克隆并初始化 submodule
 git clone --recursive https://github.com/yourname/agent-cli.git
 cd agent-cli
+./setup.sh            # 一键初始化（依赖检查 + submodule + npm + build + config）
 
-# 2. 配置
-cp providers.toml.example providers.toml
+# 编辑 .env 和 providers.toml，填入你的 API Keys 和路由配置
+
+make start            # 启动服务
+```
+
+<details>
+<summary>手动步骤（如不使用 setup.sh）</summary>
+
+```bash
+git submodule update --init --recursive
 cp .env.example .env
-# 编辑 providers.toml 和 .env，填入你的配置
-
-# 3. 安装依赖
+cp providers.toml.example providers.toml
+# 编辑 .env 和 providers.toml
 npm install
-
-# 4. 编译核心代理 (或下载 Release)
-cd source_code && go build -o ../cliproxy ./cmd/cliproxy && cd ..
-
-# 5. 生成配置
+cd source_code && go build -o ../cliproxy ./cmd/server/ && cd ..
 python3 generate_config.py
+pm2 start ecosystem.config.js
+```
+</details>
 
-# 6. (optional) OAuth 登录 (如使用 antigravity/codex)
+可选后续操作：
+
+```bash
+# OAuth 登录（如使用 antigravity/codex）
 ./cliproxy --antigravity-login
 ./cliproxy --codex-login
 
-# 7. 启动
-pm2 start ecosystem.config.js
-
-# 8. 部署 cld 到 zsh fpath (可选)
+# 部署 cld 到 zsh fpath
 ./deploy_cld.sh
 ```
 
@@ -141,6 +147,8 @@ pm2 logs                     # 查看日志
 
 ```
 agent-cli/
+├── setup.sh                # 一键初始化脚本
+├── Makefile                # 常用操作入口
 ├── providers.toml.example  # 配置模板
 ├── .env.example            # 密钥模板
 ├── generate_config.py      # 配置生成器

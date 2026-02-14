@@ -7,9 +7,32 @@
 
 _die() { echo "❌ $1"; }
 
+# SSH 非登录 shell 常缺少 Homebrew PATH，先补常见路径
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# SSH 非交互场景（如 `ssh host cld`）没有 tty，不能走 fzf 交互
+local HAS_TTY="0"
+if [[ -t 0 && -t 1 && "${TERM:-}" != "dumb" ]]; then
+  HAS_TTY="1"
+fi
+
 # 依赖检查
-command -v claude >/dev/null 2>&1 || { _die "未找到 claude 命令"; return 1; }
-command -v fzf    >/dev/null 2>&1 || { _die "未安装 fzf"; return 1; }
+local CLAUDE_CMD="${CLD_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+if [[ -z "$CLAUDE_CMD" ]]; then
+  for cand in /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [[ -x "$cand" ]]; then
+      CLAUDE_CMD="$cand"
+      break
+    fi
+  done
+fi
+[[ -z "$CLAUDE_CMD" ]] && { _die "未找到 claude 命令"; return 1; }
+if [[ "$HAS_TTY" == "1" ]]; then
+  local FZF_CMD="$(command -v fzf 2>/dev/null || true)"
+  [[ -z "$FZF_CMD" ]] && [[ -x /opt/homebrew/bin/fzf ]] && FZF_CMD="/opt/homebrew/bin/fzf"
+  [[ -z "$FZF_CMD" ]] && [[ -x /usr/local/bin/fzf ]] && FZF_CMD="/usr/local/bin/fzf"
+  [[ -z "$FZF_CMD" ]] && { _die "未安装 fzf"; return 1; }
+fi
 
 # ================= 配置 =================
 local PROXY_BASE="http://127.0.0.1:8145"
@@ -44,6 +67,13 @@ _set_title() {
   else
     printf "\033]0;%s\007" "$t"
   fi
+}
+
+_healthcheck_proxy_base() {
+  local base="$(_norm_base "$1")"
+  local url="${base}/v1/models"
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -m 3 "$url" >/dev/null 2>&1
 }
 
 # 获取可用模型列表
@@ -133,9 +163,14 @@ if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "ag" || "${1:-}" == "offic
   mode="$1"
   shift 1
 else
-  # 交互式选择模式
-  mode="$(printf "cp (Custom Proxy)\nag (Antigravity Direct)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
-  [[ -z "$mode" ]] && return 0
+  if [[ "$HAS_TTY" == "1" ]]; then
+    # 交互式选择模式
+    mode="$(printf "cp (Custom Proxy)\nag (Antigravity Direct)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
+    [[ -z "$mode" ]] && return 0
+  else
+    mode="${CLD_DEFAULT_MODE:-cp}"
+    echo "ℹ️ No TTY detected, auto mode: $mode"
+  fi
 fi
 
 mkdir -p "$CACHE_DIR/$mode" >/dev/null 2>&1 || true
@@ -155,9 +190,14 @@ case "$mode" in
     local cp_dir="$CACHE_DIR/cp"
     mkdir -p "$cp_dir" >/dev/null 2>&1 || true
 
+    if ! _healthcheck_proxy_base "$PROXY_BASE"; then
+      _die "无法连接 cliProxyAPI: ${PROXY_BASE} (检查 8145 端口和 PM2 进程)"
+      return 1
+    fi
+
     # 获取模型列表 (从 TOML 实时解析)
     local avail_models="$(_get_proxy_models)"
-    [[ -z "$avail_models" ]] && _die "无法从 TOML 获取模型列表"
+    [[ -z "$avail_models" ]] && { _die "无法从 TOML 获取模型列表"; return 1; }
 
     # 定义角色和默认记忆文件
     local -A roles=(
@@ -202,6 +242,45 @@ case "$mode" in
         # 跳过交互
         goto_exec=true
       fi
+    fi
+
+    if [[ "$goto_exec" != "true" && "$HAS_TTY" != "1" ]]; then
+      local default_main="${CLD_CP_MAIN_DEFAULT:-g3f}"
+      local default_fast="${CLD_CP_FAST_DEFAULT:-$default_main}"
+      local default_opus="${CLD_CP_OPUS_DEFAULT:-opus4.6}"
+
+      local main_model="$default_main"
+      local fast_model="$default_fast"
+      local opus_model="$default_opus"
+
+      [[ -f "$cp_dir/last_main" ]] && main_model="$(cat "$cp_dir/last_main")"
+      [[ -f "$cp_dir/last_fast" ]] && fast_model="$(cat "$cp_dir/last_fast")"
+      [[ -f "$cp_dir/last_opus" ]] && opus_model="$(cat "$cp_dir/last_opus")"
+
+      if ! echo "$avail_models" | grep -q "^${main_model}$"; then
+        main_model="$(echo "$avail_models" | head -1)"
+      fi
+      if ! echo "$avail_models" | grep -q "^${fast_model}$"; then
+        fast_model="$main_model"
+      fi
+      if ! echo "$avail_models" | grep -q "^${opus_model}$"; then
+        opus_model="$main_model"
+      fi
+
+      echo "📦 Non-interactive: Main=$main_model  Fast=$fast_model  Opus=$opus_model"
+      envs+=( "${roles[main]}=$main_model" "${roles[fast]}=$fast_model" "${roles[opus]}=$opus_model" )
+      envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$fast_model" )
+
+      echo "$main_model" > "$cp_dir/last_main"
+      echo "$fast_model" > "$cp_dir/last_fast"
+      echo "$opus_model" > "$cp_dir/last_opus"
+
+      envs+=(
+        "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
+        "ANTHROPIC_API_KEY=$PROXY_KEY"
+        "CLAUDE_CONFIG_DIR=$cp_dir"
+      )
+      goto_exec=true
     fi
 
     # ── 场景预设选择 ──
@@ -389,5 +468,21 @@ esac
 
 _set_title "$title"
 
+# 无 TTY 时，若未传任何 Claude 参数，会陷入“看起来卡住”
+if [[ "$HAS_TTY" != "1" && "$#" -eq 0 ]]; then
+  _die "当前无交互 TTY，无法进入 Claude 交互界面。请使用: ssh -tt <host> cld cp g3f  或  cld cp g3f -p '你的问题'"
+  return 2
+fi
+
 # 执行 Claude，并透传剩余参数
-env "${envs[@]}" claude "$@"
+local tty_dev=""
+if [[ "$HAS_TTY" == "1" ]]; then
+  tty_dev="$(tty 2>/dev/null || true)"
+fi
+
+echo "▶ Launching claude..."
+if [[ "$HAS_TTY" == "1" && "$tty_dev" == /dev/* ]]; then
+  env "${envs[@]}" "$CLAUDE_CMD" "$@" <"$tty_dev" >"$tty_dev" 2>&1
+else
+  env "${envs[@]}" "$CLAUDE_CMD" "$@"
+fi
