@@ -160,9 +160,10 @@ def _load_provider_map() -> dict[str, str]:
     return _PROVIDER_MAP
 
 
-def _infer_provider(rewritten_model: str) -> str:
+def _infer_provider(rewritten_model: str, requested_model: str = "") -> str:
     """Resolve provider from rewritten model, using TOML mapping then heuristics."""
-    rm = rewritten_model or ""
+    # Try rewritten_model first, then fall back to requested_model
+    rm = rewritten_model or requested_model or ""
     mapping = _load_provider_map()
     if rm in mapping:
         return mapping[rm]
@@ -173,6 +174,12 @@ def _infer_provider(rewritten_model: str) -> str:
         return "anthropic"
     if m.startswith(("gpt", "openai/")):
         return "openai"
+    if "codex" in m or m.startswith("gpt-5"):
+        return "codex"
+    if "minimax" in m or m.startswith("minimax"):
+        return "minimax"
+    if "antigravity" in m:
+        return "antigravity"
     return "(unknown)"
 
 
@@ -199,8 +206,19 @@ def process_day(day: date) -> dict:
 
             model = rec["request"].get("model") or "(unknown)"
             routing = rec.get("routing") or {}
-            instance = routing.get("target_instance") or "(unknown)"
-            provider = routing.get("provider") or _infer_provider(routing.get("rewritten_model"))
+            instance = routing.get("target_instance")
+            # Fallback: infer instance from target_url
+            if not instance:
+                target_url = routing.get("target_url") or ""
+                if ":8146" in target_url:
+                    instance = "official"
+                elif ":8147" in target_url:
+                    instance = "zenmux"
+            instance = instance or "(unknown)"
+            # Infer provider: try routing fields first, then fall back to request model
+            provider = routing.get("provider") or _infer_provider(
+                routing.get("rewritten_model"), routing.get("requested_model") or model
+            )
 
             decision = routing.get("decision") or "(none)"
             decisions[decision] += 1
