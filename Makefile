@@ -1,6 +1,10 @@
 .PHONY: setup config start restart stop status logs build clean happy help
 
-export PATH := /opt/homebrew/bin:$(PATH)
+# Find pm2 - try common locations
+PM2 := $(shell which pm2 2>/dev/null || \
+		which /opt/homebrew/bin/pm2 2>/dev/null || \
+		which /usr/local/bin/pm2 2>/dev/null || \
+		echo "pm2")
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -13,19 +17,19 @@ config: ## Generate runtime config from providers.toml
 	python3 generate_config.py
 
 start: ## Start all services via pm2
-	pm2 start ecosystem.config.js
+	$(PM2) start ecosystem.config.js
 
 restart: ## Restart all services via pm2
-	pm2 restart all
+	$(PM2) restart all
 
 stop: ## Stop all services via pm2
-	pm2 stop all
+	$(PM2) stop all
 
 status: ## Show pm2 process status
-	pm2 status
+	$(PM2) status
 
 logs: ## Tail pm2 logs
-	pm2 logs
+	$(PM2) logs
 
 build: ## Build cliproxy binary from submodule source
 	cd source_code && go build -o ../cliproxy ./cmd/server/
