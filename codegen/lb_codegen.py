@@ -1283,7 +1283,8 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
                 url: req.url,
                 headers: sanitizeHeaders(req.headers),
                 body: LOG_VERBOSE ? (req._requestBody || null) : summarizeRequestBody(req._requestBody),
-                model: req._requestedModel || req._model || null
+                model: req._requestedModel || req._model || null,
+                client_ip: req._clientIp
             }},
             routing: {{
                 requested_model: req._requestedModel || null,
@@ -1534,6 +1535,7 @@ function normalizeProxyPath(urlPath) {{
 
 const server = http.createServer((req, res) => {{
     req._startTime = Date.now();
+    req._clientIp = req.socket?.remoteAddress || req.ip || req.headers['x-forwarded-for'] || 'unknown';
     req.url = normalizeProxyPath(req.url);
 
     if (req.method === 'POST') {{
