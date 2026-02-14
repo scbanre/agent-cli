@@ -105,6 +105,10 @@ pm2 start ecosystem.config.js
 ./cliproxy --antigravity-login
 ./cliproxy --codex-login
 
+# 配置 Happy CLI 使用网关（需要 jq）
+make happy
+# 或自定义模型：./scripts/setup_happy_profile.sh --main opus4.6 --opus M2.5 --fast g3f
+
 # 部署 cld 到 zsh fpath
 ./deploy_cld.sh
 ```

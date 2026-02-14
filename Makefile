@@ -1,4 +1,4 @@
-.PHONY: setup config start restart stop status logs build clean help
+.PHONY: setup config start restart stop status logs build clean happy help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -27,6 +27,9 @@ logs: ## Tail pm2 logs
 
 build: ## Build cliproxy binary from submodule source
 	cd source_code && go build -o ../cliproxy ./cmd/server/
+
+happy: ## Configure Happy CLI to use cliproxyapi gateway
+	./scripts/setup_happy_profile.sh
 
 clean: ## Remove generated config files
 	rm -f ecosystem.config.js lb.js
