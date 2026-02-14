@@ -39,6 +39,21 @@ fi
 local PROXY_BASE="${CLD_PROXY_BASE:-http://127.0.0.1:8145}"
 local PROXY_KEY="${CLD_PROXY_KEY:-}"  # 优先读环境变量，默认空
 
+# 检测是否已认证（通过是否存在 .claude.json）
+_is_authenticated() {
+  local cp_dir="${1:-$CACHE_DIR/cp}"
+  [[ -f "$cp_dir/.claude.json" ]]
+}
+
+# 是否设置自定义 BASE_URL（已认证则设置，未认证则不设置让客户端直连官方认证）
+_would_use_base_url() {
+  local cp_dir="$CACHE_DIR/cp"
+  if [[ "$CLD_USE_BASE_URL" == "false" ]]; then
+    return 1
+  fi
+  _is_authenticated "$cp_dir"
+}
+
 local CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cld"
 local UI_FZF_HEIGHT="40%"
 # ========================================
@@ -170,13 +185,13 @@ _get_proxy_models() {
 
 local mode=""
 # 1. 模式选择 (如果没有参数)
-if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "ag" || "${1:-}" == "official") ]]; then
+if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "official") ]]; then
   mode="$1"
   shift 1
 else
   if [[ "$HAS_TTY" == "1" ]]; then
     # 交互式选择模式
-    mode="$(printf "cp (Custom Proxy)\nag (Antigravity Direct)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
+    mode="$(printf "cp (Custom Proxy)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
     [[ -z "$mode" ]] && return 0
   else
     mode="${CLD_DEFAULT_MODE:-cp}"
@@ -247,10 +262,10 @@ case "$mode" in
 
         # 注入其他基础变量
         envs+=(
-          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
           "ANTHROPIC_API_KEY=$PROXY_KEY"
           "CLAUDE_CONFIG_DIR=$cp_dir"
         )
+        _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
         # 跳过交互
         goto_exec=true
       fi
@@ -288,10 +303,10 @@ case "$mode" in
       echo "$opus_model" > "$cp_dir/last_opus"
 
       envs+=(
-        "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
         "ANTHROPIC_API_KEY=$PROXY_KEY"
         "CLAUDE_CONFIG_DIR=$cp_dir"
       )
+      _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
       goto_exec=true
     fi
 
@@ -382,10 +397,10 @@ case "$mode" in
         echo "$s_opus" > "$cp_dir/last_opus"
 
         envs+=(
-          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
           "ANTHROPIC_API_KEY=$PROXY_KEY"
           "CLAUDE_CONFIG_DIR=$cp_dir"
         )
+        _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
         goto_exec=true
       fi
     fi
@@ -436,10 +451,10 @@ case "$mode" in
 
       # 注入基础变量
       envs+=(
-        "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
         "ANTHROPIC_API_KEY=$PROXY_KEY"
         "CLAUDE_CONFIG_DIR=$cp_dir"
       )
+      _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
     fi
 
     # 提取 Main 模型名用于标题
