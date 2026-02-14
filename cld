@@ -35,25 +35,17 @@ if [[ "$HAS_TTY" == "1" ]]; then
 fi
 
 # ================= 配置 =================
-local PROXY_BASE="http://127.0.0.1:8145"
-local PROXY_KEY="dummy-key"  # 网关鉴权主要靠内部配置，这里传 dummy 即可
-
-local AG_BASE="${ANTI_API_BASE:-http://127.0.0.1:8045/v1}"
-local AG_KEY="${ANTI_API_TOKEN:-}"
-
-# AG 模型配置
-local AG_CODE_MODEL="${CLD_AG_CODE_MODEL:-claude-opus-4-6-thinking}"
-local AG_DOC_MODEL="${CLD_AG_DOC_MODEL:-gemini-3-pro-high}"
-local AG_FAST_MODEL="${CLD_AG_FAST_MODEL:-gemini-3-flash}"
+# 支持环境变量覆盖
+local PROXY_BASE="${CLD_PROXY_BASE:-http://127.0.0.1:8145}"
+local PROXY_KEY="${CLD_PROXY_KEY:-}"  # 优先读环境变量，默认空
 
 local CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cld"
 local UI_FZF_HEIGHT="40%"
 # ========================================
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "help" ]]; then
-  echo "Usage: cld [cp|ag] [model_filter] [args...]"
+  echo "Usage: cld [cp] [model_filter] [args...]"
   echo "  cp: Connect to cliProxyAPI (Load Balanced)"
-  echo "  ag: Connect to Antigravity directly (Debug)"
   return 0
 fi
 
@@ -105,11 +97,10 @@ _resolve_toml_file() {
     candidates+=("${0:A:h}/providers.toml")
   fi
 
-  # 常见工作目录/部署目录
+  # 常见工作目录
   candidates+=(
     "$PWD/providers.toml"
     "$PWD/../providers.toml"
-    "/Volumes/ext/env/cliproxyapi/providers.toml"
   )
 
   local path=""
@@ -121,6 +112,26 @@ _resolve_toml_file() {
   done
 
   return 1
+}
+
+# 从 TOML 读取 proxy 配置
+_get_proxy_config() {
+  local toml="$(_resolve_toml_file 2>/dev/null || true)"
+  if [[ -n "$toml" && -f "$toml" ]]; then
+    local port proxy_url
+    port=$(awk '/^main_port[[:space:]]*=/ { gsub(/[[:space:]]*/, "", $3); print $3; exit }' "$toml")
+    proxy_url=$(awk '/^proxy[[:space:]]*=/ { gsub(/[[:space:]]*"/, "", $3); gsub(/".*$/, "", $3); print $3; exit }' "$toml")
+    if [[ -n "$port" ]]; then
+      echo "http://127.0.0.1:${port}"
+      return
+    fi
+    if [[ -n "$proxy_url" ]]; then
+      echo "$proxy_url"
+      return
+    fi
+  fi
+  # 默认值
+  echo "http://127.0.0.1:8145"
 }
 
 _get_proxy_models() {
@@ -435,27 +446,6 @@ case "$mode" in
     local main_model="${envs[(r)ANTHROPIC_MODEL=*]}"
     main_model="${main_model#*=}"
     title="cld:cp:$(_short_model "$main_model")"
-    ;;
-
-  ag)
-    [[ -z "$AG_KEY" ]] && { _die "Missing ANTI_API_TOKEN"; return 1; }
-    echo "🚀 Mode: Antigravity Direct"
-    mkdir -p "$CACHE_DIR/ag" >/dev/null 2>&1 || true
-
-    envs+=(
-      "ANTHROPIC_BASE_URL=$(_norm_base "$AG_BASE")"
-      "ANTHROPIC_API_KEY=$AG_KEY"
-      "ANTHROPIC_MODEL=$AG_CODE_MODEL"
-      "ANTHROPIC_DEFAULT_SONNET_MODEL=$AG_CODE_MODEL"
-      "ANTHROPIC_DEFAULT_OPUS_MODEL=$AG_DOC_MODEL"
-      "ANTHROPIC_DEFAULT_HAIKU_MODEL=$AG_FAST_MODEL"
-      "CLAUDE_CODE_SUBAGENT_MODEL=haiku"
-      "CLAUDE_CONFIG_DIR=$CACHE_DIR/ag"
-    )
-    title="cld:ag:${AG_CODE_MODEL}"
-    echo "   Code=$AG_CODE_MODEL"
-    echo "   Doc =$AG_DOC_MODEL"
-    echo "   Fast=$AG_FAST_MODEL"
     ;;
 
   official)
