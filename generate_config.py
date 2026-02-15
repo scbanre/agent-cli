@@ -105,6 +105,14 @@ def generate_instance_config(name, instance_conf, routing, global_conf):
     if routing_strategy:
         yaml_conf["routing"] = {"strategy": routing_strategy}
 
+    request_log = pick_conf(instance_conf, global_conf, "request_log")
+    if request_log is not None:
+        yaml_conf["request-log"] = coerce_bool(request_log)
+
+    logs_max_total_size_mb = pick_conf(instance_conf, global_conf, "logs_max_total_size_mb")
+    if logs_max_total_size_mb is not None:
+        yaml_conf["logs-max-total-size-mb"] = max(0, coerce_int(logs_max_total_size_mb))
+
     disable_cooling = pick_conf(instance_conf, global_conf, "disable_cooling")
     if disable_cooling is not None:
         yaml_conf["disable-cooling"] = coerce_bool(disable_cooling)

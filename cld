@@ -217,12 +217,6 @@ case "$mode" in
     local cp_dir="$CACHE_DIR/cp"
     mkdir -p "$cp_dir" >/dev/null 2>&1 || true
 
-    # 禁用非必要流量，节省代理配额
-    envs+=(
-      "DISABLE_NON_ESSENTIAL_MODEL_CALLS=${DISABLE_NON_ESSENTIAL_MODEL_CALLS:-1}"
-      "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC:-1}"
-    )
-
     if ! _healthcheck_proxy_base "$PROXY_BASE"; then
       _die "无法连接 cliProxyAPI: ${PROXY_BASE} (检查 8145 端口和 PM2 进程)"
       return 1
