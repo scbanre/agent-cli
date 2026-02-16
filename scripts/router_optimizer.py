@@ -94,15 +94,27 @@ def analyze(records: list[dict]) -> dict:
     # 2. Rule hit rates (auto requests only)
     rule_hits: dict[str, int] = defaultdict(int)
     rule_targets: dict[str, str] = {}
+    category_hits: dict[str, int] = defaultdict(int)
+    category_targets: dict[str, str] = {}
     for rec in auto_records:
         mr = (rec.get("routing") or {}).get("model_router", {})
         hit = mr.get("hit_rule")
         if hit:
-            rule_hits[hit] += 1
-            # Try to capture target from suggested_model
+            rule_name = hit if isinstance(hit, str) else (hit.get("name", "") if isinstance(hit, dict) else str(hit))
+            rule_hits[rule_name] += 1
             suggested = mr.get("suggested_model", "")
             if suggested:
-                rule_targets[hit] = suggested
+                rule_targets[rule_name] = suggested
+            # Track category hits separately
+            if isinstance(hit, dict):
+                name = hit.get("name", "")
+            else:
+                name = str(hit)
+            if name.startswith("cat_"):
+                cat_name = name[4:]
+                category_hits[cat_name] += 1
+                if suggested:
+                    category_targets[cat_name] = suggested
         else:
             rule_hits["(default)"] += 1
             rule_targets["(default)"] = mr.get("suggested_model", "g3f")
@@ -138,6 +150,8 @@ def analyze(records: list[dict]) -> dict:
         "factor_percentiles": factor_pcts,
         "rule_hits": dict(rule_hits),
         "rule_targets": rule_targets,
+        "category_hits": dict(category_hits),
+        "category_targets": category_targets,
         "model_perf": dict(model_perf),
     }
 
@@ -240,6 +254,20 @@ def print_report(analysis: dict, show_suggest: bool) -> None:
             pcts = fp[field]
             parts = "  ".join(f"P{p}={v:.0f}" for p, v in sorted(pcts.items()))
             print(f"  {field:<20s} {parts}")
+        print()
+
+    # Category distribution
+    category_hits = analysis.get("category_hits", {})
+    category_targets = analysis.get("category_targets", {})
+    if category_hits and total > 0:
+        print("Category Distribution:")
+        for cat, count in sorted(category_hits.items(), key=lambda x: -x[1]):
+            pct = count / total * 100
+            target = category_targets.get(cat, "?")
+            print(f"  {cat:<24s} {pct:5.1f}%  ({count:>4d} hits)  -> {target}")
+        cat_total = sum(category_hits.values())
+        cat_pct = cat_total / total * 100 if total else 0
+        print(f"  {'(category total)':<24s} {cat_pct:5.1f}%  ({cat_total:>4d} hits)")
         print()
 
     # Rule hit rates

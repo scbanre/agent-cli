@@ -174,12 +174,44 @@ def _normalize_lb_model_router_config(lb_script_path, global_conf):
     shadow_only = coerce_bool(base_conf.get("shadow_only", False))
     log_factors = coerce_bool(base_conf.get("log_factors", True))
 
+    raw_categories = base_conf.get("categories", [])
+    normalized_categories = []
+    if isinstance(raw_categories, list):
+        for idx, raw_cat in enumerate(raw_categories):
+            if not isinstance(raw_cat, dict):
+                continue
+            cat_name = str(raw_cat.get("name", f"cat_{idx + 1}")).strip()
+            target_model = str(raw_cat.get("target_model", "")).strip()
+            if not target_model:
+                continue
+            try:
+                priority = coerce_int(raw_cat.get("priority", 0))
+            except Exception:
+                priority = 0
+            raw_signals = raw_cat.get("signals", [])
+            signals = []
+            if isinstance(raw_signals, list):
+                for sig in raw_signals:
+                    s = str(sig).strip()
+                    if s:
+                        signals.append(s)
+            if not signals:
+                continue
+            normalized_categories.append({
+                "name": cat_name,
+                "priority": priority,
+                "target_model": target_model,
+                "signals": signals,
+            })
+    normalized_categories.sort(key=lambda item: item.get("priority", 0), reverse=True)
+
     normalized = {
         "enabled": enabled,
         "shadow_only": shadow_only,
         "log_factors": log_factors,
         "activation_models": activation_models,
         "default_model": default_model,
+        "categories": normalized_categories,
         "rules": normalized_rules,
     }
     if isinstance(config_file, str) and config_file.strip():
@@ -359,7 +391,7 @@ function normalizeScalar(value) {{
         const lower = trimmed.toLowerCase();
         if (lower === 'true') return true;
         if (lower === 'false') return false;
-        if (/^-?\d+(\.\d+)?$/.test(trimmed)) {{
+        if (/^-?\\d+(\\.\\d+)?$/.test(trimmed)) {{
             const num = Number(trimmed);
             if (Number.isFinite(num)) return num;
         }}
@@ -424,6 +456,101 @@ function hasSystemPrompt(body) {{
     return false;
 }}
 
+function extractLastUserMessageText(body) {{
+    if (!body || !Array.isArray(body.messages)) return '';
+    for (let i = body.messages.length - 1; i >= 0; i--) {{
+        const msg = body.messages[i];
+        if (!msg || msg.role !== 'user') continue;
+        const content = msg.content;
+        if (typeof content === 'string') return content.slice(0, 2000);
+        if (Array.isArray(content)) {{
+            let text = '';
+            for (const block of content) {{
+                if (typeof block === 'string') {{ text += block; }}
+                else if (block && typeof block === 'object') {{
+                    if (typeof block.text === 'string') text += block.text;
+                    if (typeof block.input_text === 'string') text += block.input_text;
+                }}
+                if (text.length >= 2000) break;
+            }}
+            return text.slice(0, 2000);
+        }}
+        return '';
+    }}
+    return '';
+}}
+
+function classifyToolProfile(body) {{
+    if (!body || !Array.isArray(body.tools) || body.tools.length === 0) return 'none';
+    const names = new Set();
+    for (const tool of body.tools) {{
+        const name = tool?.function?.name;
+        if (typeof name === 'string') names.add(name);
+    }}
+    if (names.size === 0) return 'none';
+    const hasCoding = names.has('Edit') || names.has('Write') || names.has('NotebookEdit');
+    const hasRead = names.has('Read') || names.has('Glob') || names.has('Grep');
+    const hasExplore = names.has('Task') || names.has('WebSearch') || names.has('WebFetch');
+    const hasOps = names.has('Bash');
+    const categories = [];
+    if (hasCoding) categories.push('coding');
+    if (hasRead && !hasCoding) categories.push('read');
+    if (hasExplore) categories.push('explore');
+    if (hasOps) categories.push('ops');
+    if (categories.length > 1) return 'multi';
+    if (categories.length === 1) return categories[0];
+    return 'none';
+}}
+
+function detectCodeContext(body) {{
+    if (!body || !Array.isArray(body.messages)) return false;
+    const codePattern = /```|import\\s+|require\\s*\\(|from\\s+\\S+\\s+import|class\\s+\\w+|function\\s+\\w+|def\\s+\\w+/;
+    const start = Math.max(0, body.messages.length - 5);
+    for (let i = start; i < body.messages.length; i++) {{
+        const msg = body.messages[i];
+        if (!msg) continue;
+        const content = msg.content;
+        let text = '';
+        if (typeof content === 'string') {{ text = content; }}
+        else if (Array.isArray(content)) {{
+            for (const block of content) {{
+                if (typeof block === 'string') text += block;
+                else if (block && typeof block.text === 'string') text += block.text;
+            }}
+        }}
+        if (text && codePattern.test(text)) return true;
+    }}
+    return false;
+}}
+
+function classifySystemPromptType(body) {{
+    if (!body || typeof body !== 'object') return [];
+    const tags = [];
+    let systemText = '';
+    if (typeof body.system === 'string') {{ systemText = body.system; }}
+    else if (Array.isArray(body.system)) {{
+        for (const item of body.system) {{
+            if (typeof item === 'string') systemText += item;
+            else if (item && typeof item.text === 'string') systemText += item.text;
+        }}
+    }}
+    if (Array.isArray(body.messages)) {{
+        for (const msg of body.messages) {{
+            if (msg?.role === 'system') {{
+                const c = msg.content;
+                if (typeof c === 'string') systemText += c;
+            }}
+        }}
+    }}
+    if (!systemText) return tags;
+    const lower = systemText.toLowerCase();
+    if (lower.includes('plan mode') || lower.includes('plan_mode') || lower.includes('enterplanmode')) tags.push('plan_mode');
+    if (lower.includes('review') || lower.includes('audit') || lower.includes('code review')) tags.push('review');
+    if (systemText.length > 5000) tags.push('long');
+    if (systemText.length <= 500) tags.push('short');
+    return tags;
+}}
+
 function buildModelRouterFactors(requestedModel, body, sessionKeyHash) {{
     const messagesCount = Array.isArray(body?.messages) ? body.messages.length : 0;
     const toolsCount = Array.isArray(body?.tools) ? body.tools.length : 0;
@@ -437,7 +564,11 @@ function buildModelRouterFactors(requestedModel, body, sessionKeyHash) {{
         has_system_prompt: hasSystemPrompt(body),
         prompt_chars: estimatePromptChars(body),
         failure_streak: health.failureStreak || 0,
-        success_streak: health.successStreak || 0
+        success_streak: health.successStreak || 0,
+        last_user_text: extractLastUserMessageText(body),
+        tool_profile: classifyToolProfile(body),
+        has_code_context: detectCodeContext(body),
+        system_prompt_tags: classifySystemPromptType(body)
     }};
 }}
 
@@ -550,6 +681,67 @@ function evaluateModelRouterRule(rule, factors) {{
     }};
 }}
 
+function evaluateCategorySignal(signal, factors) {{
+    if (typeof signal !== 'string') return false;
+    const colonIdx = signal.indexOf(':');
+    if (colonIdx < 0) return false;
+    const type = signal.slice(0, colonIdx).trim();
+    const value = signal.slice(colonIdx + 1).trim();
+    switch (type) {{
+        case 'keyword': {{
+            const text = factors.last_user_text;
+            if (typeof text !== 'string' || !text) return false;
+            try {{
+                return new RegExp(value, 'i').test(text);
+            }} catch (e) {{
+                return false;
+            }}
+        }}
+        case 'tool_profile':
+            return factors.tool_profile === value;
+        case 'has_code_context':
+            return String(!!factors.has_code_context) === value;
+        case 'system_tag':
+            return Array.isArray(factors.system_prompt_tags) && factors.system_prompt_tags.includes(value);
+        case 'messages_count':
+        case 'prompt_chars': {{
+            const factorVal = toFiniteNumber(factors[type]);
+            if (factorVal == null) return false;
+            const opMatch = value.match(/^(<=|>=|<|>|==|!=)(\\d+(?:\\.\\d+)?)$/);
+            if (!opMatch) return false;
+            const op = opMatch[1];
+            const threshold = Number(opMatch[2]);
+            if (!Number.isFinite(threshold)) return false;
+            if (op === '<=') return factorVal <= threshold;
+            if (op === '>=') return factorVal >= threshold;
+            if (op === '<') return factorVal < threshold;
+            if (op === '>') return factorVal > threshold;
+            if (op === '==') return factorVal === threshold;
+            if (op === '!=') return factorVal !== threshold;
+            return false;
+        }}
+        default:
+            return false;
+    }}
+}}
+
+function resolveModelViaCategories(factors, categories) {{
+    for (const cat of categories) {{
+        const signals = Array.isArray(cat.signals) ? cat.signals : [];
+        for (const signal of signals) {{
+            if (evaluateCategorySignal(signal, factors)) {{
+                return {{
+                    matched: true,
+                    category_name: cat.name || 'unnamed',
+                    target_model: cat.target_model || '',
+                    matched_signal: signal
+                }};
+            }}
+        }}
+    }}
+    return {{ matched: false, category_name: null, target_model: null, matched_signal: null }};
+}}
+
 function resolveModelViaRouter(requestedModel, body, sessionKeyHash) {{
     const requested = typeof requestedModel === 'string' ? requestedModel : '';
     const config = MODEL_ROUTER_CONFIG && typeof MODEL_ROUTER_CONFIG === 'object'
@@ -596,7 +788,25 @@ function resolveModelViaRouter(requestedModel, body, sessionKeyHash) {{
     let suggestedModel = requested;
     let decision = 'no_rule';
 
-    for (const rule of rules) {{
+    // Categories routing (priority over threshold rules)
+    const categories = Array.isArray(config.categories) ? config.categories : [];
+    if (categories.length > 0) {{
+        const catResult = resolveModelViaCategories(factors, categories);
+        if (catResult.matched && ROUTES[catResult.target_model]) {{
+            hitRule = {{
+                name: `cat_${{catResult.category_name}}`,
+                priority: 0,
+                target_model: catResult.target_model,
+                match: 'category',
+                matched_signal: catResult.matched_signal
+            }};
+            suggestedModel = catResult.target_model;
+            decision = `category_hit_${{catResult.category_name}}`;
+        }}
+    }}
+
+    // Threshold rules (fallback when no category matched)
+    if (!hitRule) {{ for (const rule of rules) {{
         const targetModel = String(rule?.target_model || '').trim();
         const ruleName = String(rule?.name || 'unnamed_rule');
         const priority = Number(rule?.priority || 0);
@@ -661,6 +871,7 @@ function resolveModelViaRouter(requestedModel, body, sessionKeyHash) {{
             }}
         }}
     }}
+    }} // end if (!hitRule) — categories guard
 
     const shadowOnly = config.shadow_only === true;
     const applied = !shadowOnly && suggestedModel !== requested;

@@ -1,6 +1,6 @@
 # cliProxyAPI
 
-多后端 AI API 聚合网关，按 model 名 + 权重路由到不同实例。
+多后端 AI API 聚合网关，语义分类 + 权重路由到不同实例。
 
 ```
 客户端请求 → LB (8145) → 物理实例 (8146/8147) → 上游 API
@@ -14,7 +14,7 @@
 | `generate_config.py` | 配置生成器：TOML → YAML + LB + PM2 |
 | `cld` | 客户端启动脚本 (FZF 选模型) |
 | `scripts/usage_stats.py` | 路由用量统计工具 |
-| `scripts/router_optimizer.py` | Auto 路由规则分析与阈值优化 |
+| `scripts/router_optimizer.py` | Auto 路由分析（类别命中分布 + 阈值优化） |
 | `.env` | API Keys (不提交) |
 
 ## 常用命令
