@@ -13,6 +13,8 @@
 | `providers.toml` | 主配置：实例定义 + 路由规则 |
 | `generate_config.py` | 配置生成器：TOML → YAML + LB + PM2 |
 | `cld` | 客户端启动脚本 (FZF 选模型) |
+| `scripts/usage_stats.py` | 路由用量统计工具 |
+| `scripts/router_optimizer.py` | Auto 路由规则分析与阈值优化 |
 | `.env` | API Keys (不提交) |
 
 ## 常用命令

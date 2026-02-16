@@ -312,10 +312,10 @@ case "$mode" in
 
     # ── 场景预设选择 ──
     if [[ "$goto_exec" != "true" ]]; then
-      local -A scenario_main=( [Performance]=opus4.6  [Balanced]=g3f      [Economy]=g3f )
-      local -A scenario_fast=( [Performance]=g3f      [Balanced]=g3f      [Economy]=g3f )
-      local -A scenario_opus=( [Performance]=opus4.6  [Balanced]=opus4.6  [Economy]=g3p )
-      local -a scenario_names=( Performance Balanced Economy Custom )
+      local -A scenario_main=( [Performance]=opus4.6  [Balanced]=g3f      [Economy]=g3f  [Auto]=auto )
+      local -A scenario_fast=( [Performance]=g3f      [Balanced]=g3f      [Economy]=g3f  [Auto]=auto )
+      local -A scenario_opus=( [Performance]=opus4.6  [Balanced]=opus4.6  [Economy]=g3p  [Auto]=opus4.6 )
+      local -a scenario_names=( Auto Performance Balanced Economy Custom )
 
       local last_scenario_file="$cp_dir/last_scenario"
       local last_scenario=""
