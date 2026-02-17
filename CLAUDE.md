@@ -1,48 +1,41 @@
-# cliProxyAPI
+# cliProxyAPI Agent Guide
 
-多后端 AI API 聚合网关，语义分类 + 权重路由到不同实例。
+多后端 AI API 聚合网关（模型路由 + 多实例编排）。
 
+```text
+客户端请求 -> LB (8145) -> 物理实例 (8146/8147) -> 上游 API
 ```
-客户端请求 → LB (8145) → 物理实例 (8146/8147) → 上游 API
-```
 
-## 核心文件
+## 1. 必须先看（高优先级规则）
 
-| 文件 | 说明 |
-|------|------|
-| `providers.toml` | 主配置：实例定义 + 路由规则 |
-| `generate_config.py` | 配置生成器：TOML → YAML + LB + PM2 |
-| `cld` | 客户端启动脚本 (FZF 选模型) |
-| `scripts/usage_stats.py` | 路由用量统计工具 |
-| `scripts/router_optimizer.py` | Auto 路由分析（类别命中分布 + 阈值优化） |
-| `.env` | API Keys (不提交) |
+- 配置入口只有 `providers.toml`（不要手改 `lb.js` / `instances/*.yaml` / `ecosystem.config.js`）。
+- 修改配置后必须执行：`python3 generate_config.py`。
+- 在本机部署形态下，重载请从外层目录执行：`/Volumes/ext/env/cliproxyapi/reload_proxy.sh`。
+- 不要在 `source_code/` 子目录执行同名 `reload_proxy.sh`（会导致 auth-dir/key 路径偏移，触发 `500`）。
 
-## 常用命令
+## 2. 高频操作
 
 ```bash
-python3 generate_config.py          # 生成配置
-pm2 start ecosystem.config.js       # 启动
-pm2 restart all                     # 重启
-pm2 logs                            # 查看日志
-./cliproxy --antigravity-login      # OAuth 登录 (Google)
-./cliproxy --codex-login            # OAuth 登录 (OpenAI)
+python3 generate_config.py
+pm2 status
+pm2 logs
+./cliproxy --login        # Google/Gemini OAuth
+./cliproxy --codex-login  # OpenAI OAuth
 ```
 
-## 变更流程
+## 3. 配置变更最小流程
 
-**添加/修改模型路由**: 编辑 `providers.toml` → `python3 generate_config.py` → `pm2 restart all`
+1. 改 `providers.toml`（路由或实例）。
+2. 执行 `python3 generate_config.py`。
+3. 从外层目录执行 `./reload_proxy.sh`。
+4. 用 `pm2 status` + 一次 `/v1/messages` 请求做验收。
 
-**添加新后端**: 在 `[instances.xxx]` 新增实例 → 在 `[routing]` 引用 → 生成配置并重启
+## 4. 深入文档（按需）
 
-## 按需查阅
+- 配置语法：`docs/agent/shared/providers-toml.md`
+- 重载与认证排障：`docs/agent/shared/runbook-reload-and-auth.md`
+- 开发记录：`docs/agent/shared/development-notes.md`
 
-| 需求 | 文档 |
-|------|------|
-| providers.toml 完整语法 | `docs/agent/shared/providers-toml.md` |
-| 端口分配 / 生成文件 | `docs/agent/shared/providers-toml.md` |
-| cld tier 映射 | `docs/agent/shared/providers-toml.md` |
+## 5. 文档同步规则
 
-## 文档同步
-
-修改 `CLAUDE.md` / `AGENTS.md` 的共享规则时，必须同步更新另一份。
-仅 "专用" 标记的段落可以不同。
+共享规则修改时，`AGENTS.md` 与 `CLAUDE.md` 必须同步更新（仅“专用”段落允许不同）。
