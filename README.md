@@ -101,8 +101,8 @@ pm2 start ecosystem.config.js
 可选后续操作：
 
 ```bash
-# OAuth 登录（如使用 antigravity/codex）
-./cliproxy --antigravity-login
+# OAuth 登录（如使用 gemini/codex）
+./cliproxy --login
 ./cliproxy --codex-login
 
 # 配置 Happy CLI 使用网关（需要 jq）
@@ -119,9 +119,26 @@ make happy
 python3 generate_config.py   # 重新生成配置
 pm2 restart all              # 重启服务
 pm2 logs                     # 查看日志
-./cliproxy --antigravity-login  # OAuth 登录 (Google)
+./cliproxy --login              # OAuth 登录 (Google/Gemini)
 ./cliproxy --codex-login        # OAuth 登录 (OpenAI)
 ```
+
+## 部署目录注意事项（重要）
+
+在 `cliproxyapi/` 外层部署目录中（例如 `/Volumes/ext/env/cliproxyapi`），请使用外层入口脚本重载：
+
+```bash
+./reload_proxy.sh
+```
+
+不要在 `source_code/` 子目录直接执行 `reload_proxy.sh`。  
+否则会生成并加载 `source_code/instances/*.yaml`，可能导致：
+
+- `auth-dir` 指向错误目录，OAuth 凭据未被读取
+- `.env` 未按预期替换，出现 `${ZENMUX_KEY}` 等未展开值
+- 请求报错 `auth_unavailable`、`unknown provider for model ...`，客户端表现为大量 `500`
+
+若已误操作，回到外层目录执行一次 `./reload_proxy.sh` 即可恢复。
 
 ## 变更流程
 
