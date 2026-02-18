@@ -14,6 +14,9 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+AUTO_MODELS = {"auto", "auto-canary"}
+CACHE_SCHEMA_VERSION = 2
+
 
 def _score_base_dir(path: Path) -> int:
     """Heuristic score for choosing runtime base directory."""
@@ -183,20 +186,119 @@ def _infer_provider(rewritten_model: str, requested_model: str = "") -> str:
     return "(unknown)"
 
 
+def _pick_model(rec: dict) -> str:
+    """Best-effort final routed model for statistics."""
+    request_model = ((rec.get("request") or {}).get("model") or "").strip()
+    routing = rec.get("routing") or {}
+    model_router = routing.get("model_router") or {}
+    for candidate in (
+        routing.get("resolved_model"),
+        model_router.get("resolved_model"),
+        model_router.get("suggested_model"),
+        request_model,
+    ):
+        if isinstance(candidate, str):
+            candidate = candidate.strip()
+            if candidate:
+                return candidate
+    return "(unknown)"
+
+
+def _requested_model(rec: dict) -> str:
+    request_model = ((rec.get("request") or {}).get("model") or "").strip()
+    routing = rec.get("routing") or {}
+    requested = routing.get("requested_model")
+    if isinstance(requested, str) and requested.strip():
+        return requested.strip()
+    if request_model:
+        return request_model
+    return "(unknown)"
+
+
+def _hit_rule_name(hit_rule: object) -> str:
+    if isinstance(hit_rule, dict):
+        name = hit_rule.get("name")
+        if isinstance(name, str):
+            return name.strip()
+        return ""
+    if isinstance(hit_rule, str):
+        return hit_rule.strip()
+    return ""
+
+
+def _auto_category(rec: dict) -> str:
+    """Extract category for auto-routed requests."""
+    requested = _requested_model(rec)
+    if requested not in AUTO_MODELS:
+        return ""
+
+    routing = rec.get("routing") or {}
+    model_router = routing.get("model_router") or {}
+    hit_rule = model_router.get("hit_rule")
+    if hit_rule is None:
+        hit_rule = routing.get("hit_rule")
+    name = _hit_rule_name(hit_rule)
+    if name.startswith("cat_"):
+        return name[4:] or "(unknown)"
+
+    decision = (model_router.get("decision") or "").strip()
+    if decision.startswith("category_hit_"):
+        return decision[len("category_hit_"):] or "(unknown)"
+    if decision == "not_activated":
+        return "(not_activated)"
+
+    if isinstance(hit_rule, dict) and hit_rule.get("match") == "category":
+        return name or "(category)"
+    return "(non_category)"
+
+
+def _request_method_path(rec: dict) -> tuple[str, str]:
+    req = rec.get("request") or {}
+    method = (req.get("method") or "").strip().upper()
+    url = (req.get("url") or "").strip()
+    path = url.split("?", 1)[0]
+    return method, path
+
+
+def _is_meta_request(rec: dict) -> bool:
+    """Requests that are not model inference and should be excluded from by_model."""
+    method, path = _request_method_path(rec)
+    if method == "GET" and path in ("/v1/models", "/models"):
+        return True
+    return False
+
+
 def process_day(day: date) -> dict:
     """Parse a single day's JSONL and return aggregated stats."""
     path = LOGS_DIR / f"{day.isoformat()}.jsonl"
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_requested_model: dict[str, dict] = defaultdict(_empty_bucket)
     by_instance: dict[str, dict] = defaultdict(_empty_bucket)
     by_provider: dict[str, dict] = defaultdict(_empty_bucket)
     by_client_ip: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model: dict[str, dict] = defaultdict(_empty_bucket)
     total = _empty_bucket()
     decisions: dict[str, int] = defaultdict(int)
     sticky_keys: set[str] = set()
+    meta_requests = 0
 
     if not path.exists():
-        return {"date": day.isoformat(), "by_model": {}, "by_instance": {}, "by_provider": {},
-                "by_client_ip": {}, "total": total, "routing": {"decisions": {}, "sticky_keys": 0}}
+        return {
+            "schema_version": CACHE_SCHEMA_VERSION,
+            "date": day.isoformat(),
+            "by_model": {},
+            "by_requested_model": {},
+            "by_instance": {},
+            "by_provider": {},
+            "by_client_ip": {},
+            "by_auto_model_category": {},
+            "by_auto_category": {},
+            "by_auto_model": {},
+            "total": total,
+            "routing": {"decisions": {}, "sticky_keys": 0},
+        }
 
     with open(path) as f:
         for line in f:
@@ -205,7 +307,8 @@ def process_day(day: date) -> dict:
                 continue
             rec = json.loads(line)
 
-            model = rec["request"].get("model") or "(unknown)"
+            requested_model = _requested_model(rec)
+            model = _pick_model(rec)
             routing = rec.get("routing") or {}
             instance = routing.get("target_instance")
             # Fallback: infer instance from target_url
@@ -218,7 +321,7 @@ def process_day(day: date) -> dict:
             instance = instance or "(unknown)"
             # Infer provider: try routing fields first, then fall back to request model
             provider = routing.get("provider") or _infer_provider(
-                routing.get("rewritten_model"), routing.get("requested_model") or model
+                routing.get("rewritten_model"), requested_model
             )
 
             # Get client IP
@@ -230,20 +333,39 @@ def process_day(day: date) -> dict:
             if sk:
                 sticky_keys.add(sk)
 
-            _add(by_model[model], rec)
-            _add(by_instance[instance], rec)
-            _add(by_provider[f"{model} @ {provider} / {instance}"], rec)
             _add(by_client_ip[client_ip], rec)
+            if _is_meta_request(rec):
+                meta_requests += 1
+            else:
+                _add(by_model[model], rec)
+                _add(by_requested_model[requested_model], rec)
+                _add(by_instance[instance], rec)
+                _add(by_provider[f"{model} @ {provider} / {instance}"], rec)
+                if requested_model in AUTO_MODELS:
+                    category = _auto_category(rec)
+                    _add(by_auto_model_category[f"{model} × {category}"], rec)
+                    _add(by_auto_category[category], rec)
+                    _add(by_auto_model[model], rec)
+
             _add(total, rec)
 
     return {
+        "schema_version": CACHE_SCHEMA_VERSION,
         "date": day.isoformat(),
         "by_model": dict(by_model),
+        "by_requested_model": dict(by_requested_model),
         "by_instance": dict(by_instance),
         "by_provider": dict(by_provider),
         "by_client_ip": dict(by_client_ip),
+        "by_auto_model_category": dict(by_auto_model_category),
+        "by_auto_category": dict(by_auto_category),
+        "by_auto_model": dict(by_auto_model),
         "total": total,
-        "routing": {"decisions": dict(decisions), "sticky_keys": len(sticky_keys)},
+        "routing": {
+            "decisions": dict(decisions),
+            "sticky_keys": len(sticky_keys),
+            "meta_requests": meta_requests,
+        },
     }
 
 
@@ -260,7 +382,9 @@ def get_day_stats(day: date, *, force: bool = False) -> dict:
     # Today is always recomputed; past days use cache when available.
     if not force and day != today and cache.exists():
         with open(cache) as f:
-            return json.load(f)
+            cached = json.load(f)
+        if isinstance(cached, dict) and cached.get("schema_version") == CACHE_SCHEMA_VERSION:
+            return cached
 
     stats = process_day(day)
 
@@ -283,35 +407,58 @@ def _merge(target: dict, source: dict) -> None:
 
 def aggregate(day_stats_list: list[dict]) -> dict:
     by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_requested_model: dict[str, dict] = defaultdict(_empty_bucket)
     by_instance: dict[str, dict] = defaultdict(_empty_bucket)
     by_provider: dict[str, dict] = defaultdict(_empty_bucket)
     by_client_ip: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model: dict[str, dict] = defaultdict(_empty_bucket)
     total = _empty_bucket()
     decisions: dict[str, int] = defaultdict(int)
     sticky_keys = 0
+    meta_requests = 0
 
     for ds in day_stats_list:
         _merge(total, ds["total"])
         for name, bucket in ds["by_model"].items():
             _merge(by_model[name], bucket)
+        for name, bucket in ds.get("by_requested_model", {}).items():
+            _merge(by_requested_model[name], bucket)
         for name, bucket in ds["by_instance"].items():
             _merge(by_instance[name], bucket)
         for name, bucket in ds.get("by_provider", {}).items():
             _merge(by_provider[name], bucket)
         for name, bucket in ds.get("by_client_ip", {}).items():
             _merge(by_client_ip[name], bucket)
+        for name, bucket in ds.get("by_auto_model_category", {}).items():
+            _merge(by_auto_model_category[name], bucket)
+        for name, bucket in ds.get("by_auto_category", {}).items():
+            _merge(by_auto_category[name], bucket)
+        for name, bucket in ds.get("by_auto_model", {}).items():
+            _merge(by_auto_model[name], bucket)
         rt = ds.get("routing") or {}
         for d, cnt in rt.get("decisions", {}).items():
             decisions[d] += cnt
         sticky_keys += rt.get("sticky_keys", 0)
+        meta_requests += rt.get("meta_requests", 0)
 
     return {
+        "schema_version": CACHE_SCHEMA_VERSION,
         "by_model": dict(by_model),
+        "by_requested_model": dict(by_requested_model),
         "by_instance": dict(by_instance),
         "by_provider": dict(by_provider),
         "by_client_ip": dict(by_client_ip),
+        "by_auto_model_category": dict(by_auto_model_category),
+        "by_auto_category": dict(by_auto_category),
+        "by_auto_model": dict(by_auto_model),
         "total": total,
-        "routing": {"decisions": dict(decisions), "sticky_keys": sticky_keys},
+        "routing": {
+            "decisions": dict(decisions),
+            "sticky_keys": sticky_keys,
+            "meta_requests": meta_requests,
+        },
     }
 
 
@@ -351,7 +498,8 @@ def print_human(agg: dict, start: date, end: date) -> None:
         f"Success: {pct(t['success'], t['requests'])}  "
         f"Tokens: {fmt_tokens_short(t['input_tokens'])} in / {fmt_tokens_short(t['output_tokens'])} out  "
         f"Avg latency: {avg_ms:,.0f} ms  "
-        f"Sticky keys: {fmt_num(rt.get('sticky_keys', 0))}"
+        f"Sticky keys: {fmt_num(rt.get('sticky_keys', 0))}  "
+        f"Meta reqs: {fmt_num(rt.get('meta_requests', 0))}"
     )
     print()
 
@@ -360,6 +508,18 @@ def print_human(agg: dict, start: date, end: date) -> None:
     if by_client_ip:
         print("--- By Client IP ---")
         print_table(by_client_ip, "Client IP")
+        print()
+
+    by_model = agg.get("by_model", {})
+    if by_model:
+        print("--- By Routed Model ---")
+        print_table(by_model, "Model")
+        print()
+
+    auto_mix = agg.get("by_auto_model_category", {})
+    if auto_mix:
+        print("--- Auto Mode: Model x Category ---")
+        print_table(auto_mix, "Model x Category")
         print()
 
     print_table(agg["by_provider"], "Model @ Provider / Instance")

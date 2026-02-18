@@ -75,7 +75,7 @@ port = 8146
 request_retry = 1
 max_retry_interval = 5
 providers = [
-  { type = "antigravity", rotation_strategy = "round-robin" },
+  { type = "gemini", rotation_strategy = "round-robin" },
   { type = "codex", rotation_strategy = "round-robin" },
 ]
 
@@ -94,7 +94,7 @@ providers = [
 ```toml
 [routing]
 "opus4.5" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-5-thinking", weight = 80 },
+  { instance = "official", provider = "gemini", model = "claude-opus-4-5-thinking", weight = 80 },
   { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.5", weight = 20 },
 ]
 ```
@@ -118,7 +118,7 @@ Gemini 3 Pro relay 推荐写法：
 
 ```toml
 "gemini-pro" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
+  { instance = "official", provider = "gemini", model = "gemini-3-pro-high", weight = 999 },
   { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 } },
 ]
 ```
@@ -127,7 +127,7 @@ Gemini 3 Pro relay 推荐写法：
 
 ```toml
 "g3f.auto" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999 },
+  { instance = "official", provider = "gemini", model = "gemini-3-flash", weight = 999 },
   { instance = "relay", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1 },
 ]
 ```
@@ -136,7 +136,7 @@ Claude 1M 上下文（可选，默认不加）示例：
 
 ```toml
 "opus4.6" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+  { instance = "official", provider = "gemini", model = "claude-opus-4-6-thinking", weight = 80, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
   { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
 ]
 ```

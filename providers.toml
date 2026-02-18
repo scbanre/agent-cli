@@ -71,16 +71,16 @@ value = 3
 # ==========================================
 
 # --- 实例 A: Official (官方原生 Auth 聚合) ---
-# 包含 Antigravity (Google) 和 OpenAI (Codex/ChatGPT)
+# 包含 Gemini (Google) 和 OpenAI (Codex/ChatGPT)
 # 均使用 OAuth 登录，无需在此填 Key
 [instances.official]
 port = 8146
 request_retry = 1
 max_retry_interval = 5
 providers = [
-  # 1. Antigravity (Google OAuth)
-  # 需运行: ./cliproxy --antigravity-login
-  { type = "antigravity", rotation_strategy = "round-robin" },
+  # 1. Gemini (Google OAuth)
+  # 需运行: ./cliproxy --login
+  { type = "gemini", rotation_strategy = "round-robin" },
 
   # 2. OpenAI Official (Codex/ChatGPT OAuth)
   # 需运行: ./cliproxy --codex-login
@@ -121,8 +121,12 @@ providers = [
 [routing]
 
 "opus4.6" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "max_tokens_max" = 24000 } },
+  { instance = "official", provider = "gemini", model = "claude-opus-4-6-thinking", weight = 80, params = { "max_tokens_max" = 24000 } },
   { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "max_tokens_max" = 24000 } },
+]
+
+"sonnet4.6" = [
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-sonnet-4.6", weight = 100, params = { "max_tokens_max" = 16000 } },
 ]
 
 "M2.5" = [
@@ -130,22 +134,22 @@ providers = [
 ]
 
 "g3f" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "official", provider = "gemini", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
   { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
 ]
 
 "g3f.auto" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
+  { instance = "official", provider = "gemini", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
   { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
 ]
 
 "g3p.auto" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
+  { instance = "official", provider = "gemini", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
   { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "max_tokens_max" = 16000 } },
 ]
 
 "g3i" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-pro-image", weight = 999 },
+  { instance = "official", provider = "gemini", model = "gemini-3-pro-image", weight = 999 },
   { instance = "zenmux", provider = "gemini", model = "google/gemini-3-pro-image-preview", weight = 1 },
 ]
 
