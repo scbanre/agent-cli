@@ -287,6 +287,28 @@ const zlib = require('zlib');
 
 const PORT = {port};
 const ROUTES = {json.dumps(routes, indent=2)};
+
+// 从 rewrite 字段推断 model_group（与 antigravity GetModelGroup 保持一致）
+function getModelGroup(rewrite) {{
+    if (!rewrite) return '';
+    if (rewrite.includes('gpt')) return 'gpt';
+    if (rewrite.includes('claude')) return 'claude';
+    if (rewrite.includes('gemini')) return 'gemini';
+    return rewrite;
+}}
+// signature group → 可处理该组 signature 的 route model 列表
+const SIGNATURE_GROUP_ROUTES = {{}};
+for (const [modelName, route] of Object.entries(ROUTES)) {{
+    for (const target of route.targets) {{
+        const group = getModelGroup(target.rewrite || '');
+        if (!group) continue;
+        if (!SIGNATURE_GROUP_ROUTES[group]) SIGNATURE_GROUP_ROUTES[group] = [];
+        if (!SIGNATURE_GROUP_ROUTES[group].includes(modelName)) {{
+            SIGNATURE_GROUP_ROUTES[group].push(modelName);
+        }}
+    }}
+}}
+
 const DEFAULT_TARGET = "{default_target}";
 const LOG_DIR = path.join(__dirname, 'logs', 'requests');
 const LOG_RETENTION_DAYS = 90;
@@ -1457,6 +1479,36 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
             }}
         }}
 
+        // Signature 透明恢复：400 signature error → 找到正确 provider 重试，对客户端不可见
+        if (routeAction.kind === 'signature' && !res.headersSent && !req._signatureRetried) {{
+            const sigGroup = extractThinkingSignatureGroup(req._requestBody);
+            if (sigGroup) {{
+                const recoveryModels = SIGNATURE_GROUP_ROUTES[sigGroup] || [];
+                for (const recoveryModel of recoveryModels) {{
+                    const recoveryRoute = ROUTES[recoveryModel];
+                    if (!recoveryRoute) continue;
+                    const candidates = getRouteCandidates(recoveryRoute, recoveryModel);
+                    const recoveryTarget = selectHighestWeightTarget(candidates.targets, candidates.weights);
+                    if (recoveryTarget) {{
+                        req._signatureRetried = true;
+                        req._model = recoveryModel;
+                        req._resolvedModel = recoveryModel;
+                        if (!Array.isArray(req._retryTrace)) req._retryTrace = [];
+                        req._retryTrace.push({{
+                            attempt: req._retryCount || 0,
+                            target: req._selectedTarget,
+                            status: proxyRes.statusCode,
+                            route_action: routeAction.kind,
+                            sig_group: sigGroup,
+                            attempt_duration_ms: Date.now() - (req._attemptStartedAt || req._startTime || Date.now())
+                        }});
+                        forwardRequestToTarget(req, res, recoveryTarget, `retry_on_signature_group_${{sigGroup}}`);
+                        return;
+                    }}
+                }}
+            }}
+        }}
+
         req._modelHealth = updateModelHealth(
             req._modelHealthKey || null,
             routeAction.kind === 'success'
@@ -1589,6 +1641,21 @@ function hasThinkingSignature(body) {{
         }}
     }}
     return false;
+}}
+
+// 从请求 messages 中提取 thinking signature 的 model_group 前缀
+function extractThinkingSignatureGroup(body) {{
+    if (!body || !Array.isArray(body.messages)) return null;
+    for (const msg of body.messages) {{
+        if (!Array.isArray(msg.content)) continue;
+        for (const block of msg.content) {{
+            if (block?.type === 'thinking' && typeof block.signature === 'string') {{
+                const hashIdx = block.signature.indexOf('#');
+                if (hashIdx > 0) return block.signature.slice(0, hashIdx);
+            }}
+        }}
+    }}
+    return null;
 }}
 
 function modelHealthKey(sessionKeyHash, sourceModel) {{
@@ -1798,7 +1865,7 @@ const server = http.createServer((req, res) => {{
             }}
             req._resolvedModel = model;
 
-            const route = ROUTES[model];
+            let route = ROUTES[model];
             if (!route) {{
                 req._targetUrl = DEFAULT_TARGET;
                 req._routingDecision = 'default_target';
@@ -1816,7 +1883,29 @@ const server = http.createServer((req, res) => {{
                     : `model_router_${{req._modelRouter.decision || 'passthrough'}}`;
             }}
 
-            if (req._hasThinkingSignature) {{
+            // thinking cross-model sticky: 当 session 已在某 model 上有 sticky 时，锁定回去
+            // 避免 model router 切换 model 导致 thinking signature 跨 provider 失效
+            if (req._hasThinkingSignature && sessionKey) {{
+                const modelList = Object.keys(ROUTES);
+                for (const candidateModel of modelList) {{
+                    const candidateRoute = ROUTES[candidateModel];
+                    if (!candidateRoute) continue;
+                    const candidateStickyKey = stickyRouteKey(sessionKey, candidateModel);
+                    const candidateSticky = getStickyTarget(candidateRoute, candidateStickyKey, candidateModel, {{ ignoreCooldown: true }});
+                    if (candidateSticky) {{
+                        model = candidateModel;
+                        req._model = model;
+                        req._resolvedModel = model;
+                        route = candidateRoute;
+                        selected = candidateSticky;
+                        req._stickyKey = candidateStickyKey;
+                        routingDecision = 'thinking_sticky_cross_model_locked';
+                        break;
+                    }}
+                }}
+            }}
+
+            if (req._hasThinkingSignature && !selected) {{
                 if (sessionKey) {{
                     const key = stickyRouteKey(sessionKey, model);
                     req._stickyKey = key;
@@ -1838,7 +1927,7 @@ const server = http.createServer((req, res) => {{
                         ? 'thinking_primary_locked_no_session_all_targets_in_cooldown'
                         : 'thinking_primary_locked_no_session';
                 }}
-            }} else {{
+            }} else if (!req._hasThinkingSignature) {{
                 if (sessionKey) {{
                     const key = stickyRouteKey(sessionKey, model);
                     req._stickyKey = key;
