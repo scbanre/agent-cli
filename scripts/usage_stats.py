@@ -173,6 +173,7 @@ def _empty_bucket() -> dict:
     return {
         "requests": 0, "success": 0, "input_tokens": 0, "output_tokens": 0,
         "duration_ms": 0, "sticky": 0, "random": 0, "thinking": 0,
+        "cache_read_tokens": 0,  # Tokens read from cache
     }
 
 
@@ -193,12 +194,18 @@ def _add(bucket: dict, rec: dict) -> None:
 
     usage = rec.get("usage")
     if usage:
+        # Track new input tokens separately from cache read tokens
         # Anthropic style
-        bucket["input_tokens"] += (usage.get("input_tokens") or 0)
-        bucket["input_tokens"] += (usage.get("cache_creation_input_tokens") or 0)
-        bucket["input_tokens"] += (usage.get("cache_read_input_tokens") or 0)
+        new_tokens = (usage.get("input_tokens") or 0)
+        new_tokens += (usage.get("cache_creation_input_tokens") or 0)
+        cache_read = (usage.get("cache_read_input_tokens") or 0)
         # OpenAI / Gemini style
-        bucket["input_tokens"] += (usage.get("prompt_tokens") or 0)
+        new_tokens += (usage.get("prompt_tokens") or 0)
+
+        # Total input tokens (for display)
+        bucket["input_tokens"] += new_tokens + cache_read
+        # Cache read tokens (for cost calculation)
+        bucket["cache_read_tokens"] += cache_read
 
         bucket["output_tokens"] += (usage.get("output_tokens") or 0)
         # OpenAI / Gemini style
@@ -467,7 +474,7 @@ def get_day_stats(day: date, *, force: bool = False) -> dict:
 
 def _merge(target: dict, source: dict) -> None:
     for key in ("requests", "success", "input_tokens", "output_tokens", "duration_ms",
-                "sticky", "random", "thinking"):
+                "sticky", "random", "thinking", "cache_read_tokens"):
         target[key] += source.get(key, 0)
 
 
@@ -637,6 +644,7 @@ def add_costs(agg: dict) -> dict:
     # Provider name format: "model @ provider / instance"
     for name, bucket in agg.get("by_provider", {}).items():
         input_tokens = bucket.get("input_tokens", 0)
+        cache_read_tokens = bucket.get("cache_read_tokens", 0)
         output_tokens = bucket.get("output_tokens", 0)
 
         # Parse provider name: "M2.5 @ minimax / official"
@@ -663,7 +671,11 @@ def add_costs(agg: dict) -> dict:
                     break
 
         if price:
-            input_cost = (input_tokens / 1_000_000) * price.get("input", 0)
+            # New input tokens = total - cache_read
+            new_input_tokens = max(0, input_tokens - cache_read_tokens)
+            # Cost = (new tokens × input price) + (cache read tokens × cache price)
+            input_cost = (new_input_tokens / 1_000_000) * price.get("input", 0)
+            input_cost += (cache_read_tokens / 1_000_000) * price.get("cache_read", 0)
             output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
         else:
             input_cost = 0
@@ -676,6 +688,7 @@ def add_costs(agg: dict) -> dict:
     # Add costs to by_model (more accurate since we can match model to pricing)
     for name, bucket in agg.get("by_model", {}).items():
         input_tokens = bucket.get("input_tokens", 0)
+        cache_read_tokens = bucket.get("cache_read_tokens", 0)
         output_tokens = bucket.get("output_tokens", 0)
 
         # Try to find pricing based on tier mapping
@@ -687,7 +700,11 @@ def add_costs(agg: dict) -> dict:
                 break
 
         if price:
-            input_cost = (input_tokens / 1_000_000) * price.get("input", 0)
+            # New input tokens = total - cache_read
+            new_input_tokens = max(0, input_tokens - cache_read_tokens)
+            # Cost = (new tokens × input price) + (cache read tokens × cache price)
+            input_cost = (new_input_tokens / 1_000_000) * price.get("input", 0)
+            input_cost += (cache_read_tokens / 1_000_000) * price.get("cache_read", 0)
             output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
         else:
             input_cost = 0
@@ -710,6 +727,7 @@ def add_costs(agg: dict) -> dict:
 
 
 def main() -> None:
+    pass
     parser = argparse.ArgumentParser(description="cliproxyapi usage statistics")
     parser.add_argument(
         "--base-dir",
