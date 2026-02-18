@@ -17,6 +17,72 @@ from pathlib import Path
 AUTO_MODELS = {"auto", "auto-canary"}
 CACHE_SCHEMA_VERSION = 2
 
+# Pricing data from Zenmux (per 1M tokens)
+# Format: {provider: {model_pattern: {"input": $, "output": $, "cache_read": $}}}
+# Prices are for <200K prompt tokens
+PRICING = {
+    # Zenmux Anthropic
+    "anthropic": {
+        "claude-opus-4.6": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write_5m": 6.25},
+        "claude-sonnet-4.6": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write_5m": 3.75},
+        "claude-opus-4.5": {"input": 5.0, "output": 25.0, "cache_read": 0.5, "cache_write_5m": 6.25},
+        "claude-sonnet-4.5": {"input": 3.0, "output": 15.0, "cache_read": 0.3, "cache_write_5m": 3.75},
+    },
+    # Zenmux OpenAI
+    "openai": {
+        "gpt-5.2": {"input": 1.75, "output": 14.0, "cache_read": 0.175},
+        "gpt-5": {"input": 1.25, "output": 10.0, "cache_read": 0.125},
+    },
+    # Zenmux Gemini (via OpenAI compatible endpoint)
+    "gemini": {
+        "gemini-3-flash-preview": {"input": 0.5, "output": 3.0, "cache_read": 0.05},
+        "gemini-3-pro-preview": {"input": 2.0, "output": 12.0, "cache_read": 0.2},
+    },
+    # Official/Minimax
+    "minimax": {
+        "minimax-m2.5": {"input": 0.3, "output": 1.2, "cache_read": 0.03},
+    },
+}
+
+# Tier to upstream model mapping (from providers.toml routing)
+TIER_MODEL_MAP = {
+    "opus4.6": "claude-opus-4.6",
+    "sonnet4.6": "claude-sonnet-4.6",
+    "M2.5": "minimax-m2.5",
+    "g3f": "gemini-3-flash-preview",
+    "g3f.auto": "gemini-3-flash-preview",
+    "g3p": "gemini-3-pro-preview",
+    "g3p.auto": "gemini-3-pro-preview",
+    "gpt5.2": "gpt-5.2",
+}
+
+
+def get_price(provider: str, model: str) -> dict:
+    """Get pricing for a model based on provider and model name."""
+    provider_pricing = PRICING.get(provider, {})
+    # Try exact match first
+    if model in provider_pricing:
+        return provider_pricing[model]
+    # Try partial match
+    for pattern, price in provider_pricing.items():
+        if pattern in model.lower():
+            return price
+    return {"input": 0, "output": 0, "cache_read": 0}
+
+
+def calculate_cost(model: str, provider: str, input_tokens: int, output_tokens: int, cached_tokens: int = 0) -> dict:
+    """Calculate cost for a request."""
+    price = get_price(provider, model)
+    input_cost = (input_tokens / 1_000_000) * price.get("input", 0)
+    output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
+    cache_savings = (cached_tokens / 1_000_000) * price.get("cache_read", 0)
+    return {
+        "input_cost": input_cost,
+        "output_cost": output_cost,
+        "cache_savings": cache_savings,
+        "total_cost": input_cost + output_cost - cache_savings,
+    }
+
 
 def _score_base_dir(path: Path) -> int:
     """Heuristic score for choosing runtime base directory."""
@@ -468,15 +534,20 @@ def print_table(data: dict[str, dict], name_header: str) -> None:
     if not data:
         return
 
+    # Check if costs are available
+    has_costs = any("total_cost" in b for b in data.values())
+
     name_w = max(len(name_header), max(len(n) for n in data))
     hdr = (f"  {name_header:<{name_w}}  {'Reqs':>6}  {'OK%':>5}  "
            f"{'In Tokens':>11}  {'Out Tokens':>11}  "
            f"{'Sticky':>6}  {'Rand':>5}  {'Think':>5}")
+    if has_costs:
+        hdr += f"  {'Est. Cost':>10}"
     print(hdr)
 
     for name in sorted(data, key=lambda n: data[n]["requests"], reverse=True):
         b = data[name]
-        print(
+        line = (
             f"  {name:<{name_w}}  {fmt_num(b['requests']):>6}  "
             f"{pct(b['success'], b['requests']):>5}  "
             f"{fmt_tokens_short(b['input_tokens']):>11}  "
@@ -485,6 +556,9 @@ def print_table(data: dict[str, dict], name_header: str) -> None:
             f"{fmt_num(b['random']):>5}  "
             f"{fmt_num(b['thinking']):>5}"
         )
+        if has_costs and "total_cost" in b:
+            line += f"  ${b['total_cost']:>9.2f}"
+        print(line)
 
 
 def print_human(agg: dict, start: date, end: date) -> None:
@@ -493,6 +567,9 @@ def print_human(agg: dict, start: date, end: date) -> None:
     print(f"=== Usage Stats: {start.isoformat()} ~ {end.isoformat()} ===")
     print()
     avg_ms = t["duration_ms"] / t["requests"] if t["requests"] else 0
+    cost_line = ""
+    if "total_cost" in t:
+        cost_line = f"  Est. Cost: ${t['total_cost']:.2f}"
     print(
         f"  Requests: {fmt_num(t['requests'])}  "
         f"Success: {pct(t['success'], t['requests'])}  "
@@ -500,6 +577,7 @@ def print_human(agg: dict, start: date, end: date) -> None:
         f"Avg latency: {avg_ms:,.0f} ms  "
         f"Sticky keys: {fmt_num(rt.get('sticky_keys', 0))}  "
         f"Meta reqs: {fmt_num(rt.get('meta_requests', 0))}"
+        + cost_line
     )
     print()
 
@@ -553,6 +631,84 @@ def resolve_days(args) -> list[date]:
     return [today - timedelta(days=i) for i in range(args.days - 1, -1, -1)]
 
 
+def add_costs(agg: dict) -> dict:
+    """Add cost calculations to aggregated data."""
+    # Add costs to by_provider
+    # Provider name format: "model @ provider / instance"
+    for name, bucket in agg.get("by_provider", {}).items():
+        input_tokens = bucket.get("input_tokens", 0)
+        output_tokens = bucket.get("output_tokens", 0)
+
+        # Parse provider name: "M2.5 @ minimax / official"
+        provider = None
+        model = name
+        if " @ " in name:
+            parts = name.split(" @ ")
+            model = parts[0]
+            provider_part = parts[1].split(" / ")[0] if " / " in parts[1] else parts[1]
+            provider = provider_part.lower()
+
+        # Try to find pricing
+        price = {}
+        if provider and provider in PRICING:
+            upstream = TIER_MODEL_MAP.get(model, model)
+            price = PRICING[provider].get(upstream, {})
+
+        if not price:
+            # Fallback: search all providers
+            upstream = TIER_MODEL_MAP.get(model, model)
+            for p, models in PRICING.items():
+                if upstream in models:
+                    price = models[upstream]
+                    break
+
+        if price:
+            input_cost = (input_tokens / 1_000_000) * price.get("input", 0)
+            output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
+        else:
+            input_cost = 0
+            output_cost = 0
+
+        bucket["input_cost"] = round(input_cost, 4)
+        bucket["output_cost"] = round(output_cost, 4)
+        bucket["total_cost"] = round(input_cost + output_cost, 4)
+
+    # Add costs to by_model (more accurate since we can match model to pricing)
+    for name, bucket in agg.get("by_model", {}).items():
+        input_tokens = bucket.get("input_tokens", 0)
+        output_tokens = bucket.get("output_tokens", 0)
+
+        # Try to find pricing based on tier mapping
+        upstream_model = TIER_MODEL_MAP.get(name, name)
+        price = {}
+        for provider, models in PRICING.items():
+            if upstream_model in models:
+                price = models[upstream_model]
+                break
+
+        if price:
+            input_cost = (input_tokens / 1_000_000) * price.get("input", 0)
+            output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
+        else:
+            input_cost = 0
+            output_cost = 0
+
+        bucket["input_cost"] = round(input_cost, 4)
+        bucket["output_cost"] = round(output_cost, 4)
+        bucket["total_cost"] = round(input_cost + output_cost, 4)
+
+    # Add costs to total
+    total = agg.get("total", {})
+    # Sum all model costs
+    total_cost = sum(
+        bucket.get("total_cost", 0)
+        for bucket in agg.get("by_model", {}).values()
+    )
+    total["total_cost"] = round(total_cost, 4)
+
+    return agg
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="cliproxyapi usage statistics")
     parser.add_argument(
@@ -564,6 +720,7 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Process all available log files")
     parser.add_argument("--force", action="store_true", help="Ignore cache, recompute everything")
     parser.add_argument("--json", action="store_true", dest="json_output", help="Output JSON instead of table")
+    parser.add_argument("--costs", action="store_true", default=True, help="Show cost estimates (default: enabled)")
     args = parser.parse_args()
 
     _apply_base_dir(_resolve_base_dir(args.base_dir))
@@ -579,6 +736,10 @@ def main() -> None:
     if agg["total"]["requests"] == 0:
         print("No requests found in the selected period.", file=sys.stderr)
         sys.exit(0)
+
+    # Add costs if requested
+    if args.costs:
+        agg = add_costs(agg)
 
     if args.json_output:
         print_json(agg, days[0], days[-1])
