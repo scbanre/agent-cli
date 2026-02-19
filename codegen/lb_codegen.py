@@ -1237,6 +1237,9 @@ function summarizeTargetParams(params) {{
     if (maxTokensDefault) {{
         summary.max_tokens_default = maxTokensDefault;
     }}
+    if (typeof params.thinking_level === 'string' && params.thinking_level.trim()) {{
+        summary.thinking_level = params.thinking_level.trim();
+    }}
     if (typeof params.anthropic_beta === 'string' && params.anthropic_beta.trim()) {{
         summary.anthropic_beta = params.anthropic_beta.trim();
     }}
@@ -1321,9 +1324,20 @@ function cloneRequestPayloadForTarget(req, target) {{
     }}
     const payload = JSON.parse(JSON.stringify(req._requestBody));
     if (typeof req._model === 'string' && req._model.length > 0) {{
-        payload.model = (target?.rewrite && target.rewrite !== req._model)
+        let rewrittenModel = (target?.rewrite && target.rewrite !== req._model)
             ? target.rewrite
             : req._model;
+        // Append thinking_level suffix so cliproxy uses this level instead of
+        // deriving one from the client's budget_tokens (which may map to an
+        // unsupported level like "xhigh" for models that only accept "low"/"high").
+        const thinkingLevel = target?.params?.thinking_level;
+        if (typeof thinkingLevel === 'string' && thinkingLevel.trim()) {{
+            // Only append if the model name doesn't already have a suffix
+            if (!rewrittenModel.includes('(')) {{
+                rewrittenModel = rewrittenModel + '(' + thinkingLevel.trim() + ')';
+            }}
+        }}
+        payload.model = rewrittenModel;
     }}
     applyTargetParamsToPayload(payload, target);
     return Buffer.from(JSON.stringify(payload));

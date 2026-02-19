@@ -33,6 +33,29 @@ if [[ ! -f "generate_config.py" ]]; then
   exit 1
 fi
 
+# 从 .env 注入运行时环境（用于 providers.toml 的 ${CLIPROXY_PROXY} 模板替换）。
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
+# 不向服务进程注入全局 HTTP(S)_PROXY，避免影响请求路由。
+# 显式清空历史代理环境变量，确保 PM2 --update-env 覆盖旧值。
+export HTTP_PROXY=""
+export HTTPS_PROXY=""
+export ALL_PROXY=""
+export http_proxy=""
+export https_proxy=""
+export all_proxy=""
+# 清理来自 Codex/Claude CLI 的会话级环境变量，避免将“沙箱禁网”等状态注入 PM2 子进程。
+while IFS="=" read -r _env_key _; do
+  case "$_env_key" in
+    CODEX_*|CLAUDE_*|CLD_*|CLAUDECODE) unset "$_env_key" ;;
+  esac
+done < <(env)
+
 if ! command -v node >/dev/null 2>&1; then
   echo "错误: 未找到 node。无法解析 ecosystem.config.js" >&2
   exit 1
