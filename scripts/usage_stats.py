@@ -11,7 +11,7 @@ import json
 import os
 import sys
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 AUTO_MODELS = {"auto", "auto-canary"}
@@ -442,10 +442,174 @@ def process_day(day: date) -> dict:
     }
 
 
+def get_time_window_stats(start_utc: datetime, end_utc: datetime) -> dict:
+    """Aggregate stats for logs in UTC time window [start_utc, end_utc)."""
+    if start_utc.tzinfo is None or end_utc.tzinfo is None:
+        raise ValueError("start_utc and end_utc must be timezone-aware")
+    start_utc = start_utc.astimezone(timezone.utc)
+    end_utc = end_utc.astimezone(timezone.utc)
+    if end_utc <= start_utc:
+        raise ValueError("end_utc must be greater than start_utc")
+
+    by_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_requested_model: dict[str, dict] = defaultdict(_empty_bucket)
+    by_instance: dict[str, dict] = defaultdict(_empty_bucket)
+    by_provider: dict[str, dict] = defaultdict(_empty_bucket)
+    by_client_ip: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_category: dict[str, dict] = defaultdict(_empty_bucket)
+    by_auto_model: dict[str, dict] = defaultdict(_empty_bucket)
+    total = _empty_bucket()
+    decisions: dict[str, int] = defaultdict(int)
+    sticky_keys: set[str] = set()
+    meta_requests = 0
+
+    day = start_utc.date()
+    end_day = (end_utc - timedelta(microseconds=1)).date()
+    paths = []
+    while day <= end_day:
+        path = LOGS_DIR / f"{day.isoformat()}.jsonl"
+        if path.exists():
+            paths.append(path)
+        day += timedelta(days=1)
+
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                ts_str = rec.get("timestamp", "")
+                if not ts_str:
+                    continue
+                try:
+                    # Handle 'Z' suffix (Python < 3.11 doesn't support it)
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                except (ValueError, TypeError):
+                    continue
+                if ts < start_utc or ts >= end_utc:
+                    continue
+
+                requested_model = _requested_model(rec)
+                model = _pick_model(rec)
+                routing = rec.get("routing") or {}
+                instance = routing.get("target_instance")
+                if not instance:
+                    target_url = routing.get("target_url") or ""
+                    if ":8146" in target_url:
+                        instance = "official"
+                    elif ":8147" in target_url:
+                        instance = "zenmux"
+                instance = instance or "(unknown)"
+                provider = routing.get("provider") or _infer_provider(
+                    routing.get("rewritten_model"), requested_model
+                )
+
+                client_ip = rec["request"].get("client_ip") or "unknown"
+                decision = routing.get("decision") or "(none)"
+                decisions[decision] += 1
+                sk = routing.get("session_key_hash")
+                if sk:
+                    sticky_keys.add(sk)
+
+                _add(by_client_ip[client_ip], rec)
+                if _is_meta_request(rec):
+                    meta_requests += 1
+                else:
+                    _add(by_model[model], rec)
+                    _add(by_requested_model[requested_model], rec)
+                    _add(by_instance[instance], rec)
+                    _add(by_provider[f"{model} @ {provider} / {instance}"], rec)
+                    if requested_model in AUTO_MODELS:
+                        category = _auto_category(rec)
+                        _add(by_auto_model_category[f"{model} × {category}"], rec)
+                        _add(by_auto_category[category], rec)
+                        _add(by_auto_model[model], rec)
+
+                _add(total, rec)
+
+    return {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "range": {"start": start_utc.isoformat(), "end": end_utc.isoformat()},
+        "by_model": dict(by_model),
+        "by_requested_model": dict(by_requested_model),
+        "by_instance": dict(by_instance),
+        "by_provider": dict(by_provider),
+        "by_client_ip": dict(by_client_ip),
+        "by_auto_model_category": dict(by_auto_model_category),
+        "by_auto_category": dict(by_auto_category),
+        "by_auto_model": dict(by_auto_model),
+        "total": total,
+        "routing": {
+            "decisions": dict(decisions),
+            "sticky_keys": len(sticky_keys),
+            "meta_requests": meta_requests,
+        },
+    }
+
+
+def get_last_hours_stats(hours: int, *, now_utc: datetime = None) -> dict:
+    """Aggregate stats for the last N hours."""
+    if hours <= 0:
+        raise ValueError("hours must be greater than 0")
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    elif now_utc.tzinfo is None:
+        raise ValueError("now_utc must be timezone-aware")
+    now_utc = now_utc.astimezone(timezone.utc)
+    start_utc = now_utc - timedelta(hours=hours)
+    return get_time_window_stats(start_utc, now_utc)
+
+
+def get_local_day_stats(local_day: date, *, local_tz: timezone, force: bool = False) -> dict:
+    """Aggregate stats for one local day [00:00, 24:00) in local timezone."""
+    cache = _local_day_cache_path(local_day, local_tz)
+    local_today = datetime.now(local_tz).date()
+    if not force and local_day != local_today and cache.exists():
+        with open(cache) as f:
+            cached = json.load(f)
+        if isinstance(cached, dict) and cached.get("schema_version") == CACHE_SCHEMA_VERSION:
+            return cached
+
+    local_start = datetime(local_day.year, local_day.month, local_day.day, tzinfo=local_tz)
+    local_end = local_start + timedelta(days=1)
+    start_utc = local_start.astimezone(timezone.utc)
+    end_utc = local_end.astimezone(timezone.utc)
+    stats = get_time_window_stats(start_utc, end_utc)
+    stats["local_day"] = local_day.isoformat()
+    stats["local_tz"] = _tz_suffix(local_tz, local_day)
+
+    if local_day != local_today:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache, "w") as f:
+            json.dump(stats, f)
+
+    return stats
+
+
 # ── caching ──────────────────────────────────────────────────────────────
 
 def _cache_path(day: date) -> Path:
     return CACHE_DIR / f"{day.isoformat()}.json"
+
+
+def _tz_suffix(local_tz: timezone, day: date) -> str:
+    local_dt = datetime(day.year, day.month, day.day, tzinfo=local_tz)
+    offset = local_dt.utcoffset() or timedelta(0)
+    total_min = int(offset.total_seconds() // 60)
+    sign = "+" if total_min >= 0 else "-"
+    total_min = abs(total_min)
+    hh, mm = divmod(total_min, 60)
+    return f"{sign}{hh:02d}{mm:02d}"
+
+
+def _local_day_cache_path(local_day: date, local_tz: timezone) -> Path:
+    return CACHE_DIR / f"localday-{local_day.isoformat()}-{_tz_suffix(local_tz, local_day)}.json"
 
 
 def get_day_stats(day: date, *, force: bool = False) -> dict:
@@ -638,90 +802,86 @@ def resolve_days(args) -> list[date]:
     return [today - timedelta(days=i) for i in range(args.days - 1, -1, -1)]
 
 
+def _resolve_price(model: str, provider_hint: str = "") -> dict:
+    """Resolve pricing dict for a model, optionally scoped to a provider."""
+    upstream = TIER_MODEL_MAP.get(model, model)
+    if provider_hint and provider_hint in PRICING:
+        price = PRICING[provider_hint].get(upstream, {})
+        if price:
+            return price
+    for _p, models in PRICING.items():
+        if upstream in models:
+            return models[upstream]
+    return {}
+
+
+def _enrich_bucket(bucket: dict, price: dict) -> None:
+    """Compute cost and derived metrics on a stats bucket in-place."""
+    input_tokens = bucket.get("input_tokens", 0)
+    cache_read_tokens = bucket.get("cache_read_tokens", 0)
+    output_tokens = bucket.get("output_tokens", 0)
+
+    if price:
+        new_input_tokens = max(0, input_tokens - cache_read_tokens)
+        input_cost = (new_input_tokens / 1_000_000) * price.get("input", 0)
+        input_cost += (cache_read_tokens / 1_000_000) * price.get("cache_read", 0)
+        output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
+    else:
+        input_cost = 0
+        output_cost = 0
+
+    bucket["input_cost"] = round(input_cost, 4)
+    bucket["output_cost"] = round(output_cost, 4)
+    bucket["total_cost"] = round(input_cost + output_cost, 4)
+
+    requests = bucket.get("requests", 0)
+    if requests:
+        bucket["avg_latency_ms"] = round(bucket.get("duration_ms", 0) / requests, 2)
+        bucket["tokens_per_req"] = round(input_tokens / requests, 2)
+        bucket["output_per_req"] = round(output_tokens / requests, 2)
+        bucket["cost_per_req"] = round(bucket["total_cost"] / requests, 4)
+
+    if input_tokens:
+        bucket["cache_hit_rate"] = round(cache_read_tokens / input_tokens, 4)
+
+
 def add_costs(agg: dict) -> dict:
     """Add cost calculations to aggregated data."""
-    # Add costs to by_provider
-    # Provider name format: "model @ provider / instance"
+    # by_provider — key: "model @ provider / instance"
     for name, bucket in agg.get("by_provider", {}).items():
-        input_tokens = bucket.get("input_tokens", 0)
-        cache_read_tokens = bucket.get("cache_read_tokens", 0)
-        output_tokens = bucket.get("output_tokens", 0)
-
-        # Parse provider name: "M2.5 @ minimax / official"
-        provider = None
         model = name
+        provider_hint = ""
         if " @ " in name:
             parts = name.split(" @ ")
             model = parts[0]
-            provider_part = parts[1].split(" / ")[0] if " / " in parts[1] else parts[1]
-            provider = provider_part.lower()
+            provider_hint = (parts[1].split(" / ")[0] if " / " in parts[1] else parts[1]).lower()
+        _enrich_bucket(bucket, _resolve_price(model, provider_hint))
 
-        # Try to find pricing
-        price = {}
-        if provider and provider in PRICING:
-            upstream = TIER_MODEL_MAP.get(model, model)
-            price = PRICING[provider].get(upstream, {})
-
-        if not price:
-            # Fallback: search all providers
-            upstream = TIER_MODEL_MAP.get(model, model)
-            for p, models in PRICING.items():
-                if upstream in models:
-                    price = models[upstream]
-                    break
-
-        if price:
-            # New input tokens = total - cache_read
-            new_input_tokens = max(0, input_tokens - cache_read_tokens)
-            # Cost = (new tokens × input price) + (cache read tokens × cache price)
-            input_cost = (new_input_tokens / 1_000_000) * price.get("input", 0)
-            input_cost += (cache_read_tokens / 1_000_000) * price.get("cache_read", 0)
-            output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
-        else:
-            input_cost = 0
-            output_cost = 0
-
-        bucket["input_cost"] = round(input_cost, 4)
-        bucket["output_cost"] = round(output_cost, 4)
-        bucket["total_cost"] = round(input_cost + output_cost, 4)
-
-    # Add costs to by_model (more accurate since we can match model to pricing)
+    # by_model — key: tier name or upstream model
     for name, bucket in agg.get("by_model", {}).items():
-        input_tokens = bucket.get("input_tokens", 0)
-        cache_read_tokens = bucket.get("cache_read_tokens", 0)
-        output_tokens = bucket.get("output_tokens", 0)
+        _enrich_bucket(bucket, _resolve_price(name))
 
-        # Try to find pricing based on tier mapping
-        upstream_model = TIER_MODEL_MAP.get(name, name)
-        price = {}
-        for provider, models in PRICING.items():
-            if upstream_model in models:
-                price = models[upstream_model]
-                break
+    # by_auto_model_category — key: "model × category"
+    for name, bucket in agg.get("by_auto_model_category", {}).items():
+        model = name.split(" × ")[0] if " × " in name else name
+        _enrich_bucket(bucket, _resolve_price(model))
 
-        if price:
-            # New input tokens = total - cache_read
-            new_input_tokens = max(0, input_tokens - cache_read_tokens)
-            # Cost = (new tokens × input price) + (cache read tokens × cache price)
-            input_cost = (new_input_tokens / 1_000_000) * price.get("input", 0)
-            input_cost += (cache_read_tokens / 1_000_000) * price.get("cache_read", 0)
-            output_cost = (output_tokens / 1_000_000) * price.get("output", 0)
-        else:
-            input_cost = 0
-            output_cost = 0
-
-        bucket["input_cost"] = round(input_cost, 4)
-        bucket["output_cost"] = round(output_cost, 4)
-        bucket["total_cost"] = round(input_cost + output_cost, 4)
-
-    # Add costs to total
+    # total — sum costs from by_model
     total = agg.get("total", {})
-    # Sum all model costs
-    total_cost = sum(
-        bucket.get("total_cost", 0)
-        for bucket in agg.get("by_model", {}).values()
-    )
+    total_cost = sum(b.get("total_cost", 0) for b in agg.get("by_model", {}).values())
     total["total_cost"] = round(total_cost, 4)
+
+    requests = total.get("requests", 0)
+    if requests:
+        total["avg_latency_ms"] = round(total.get("duration_ms", 0) / requests, 2)
+        total["tokens_per_req"] = round(total.get("input_tokens", 0) / requests, 2)
+        total["output_per_req"] = round(total.get("output_tokens", 0) / requests, 2)
+        total["cost_per_req"] = round(total_cost / requests, 4)
+
+    total_input = total.get("input_tokens", 0)
+    total_cache = total.get("cache_read_tokens", 0)
+    if total_input:
+        total["cache_hit_rate"] = round(total_cache / total_input, 4)
 
     return agg
 
