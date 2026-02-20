@@ -7,6 +7,18 @@
 
 _die() { echo "❌ $1"; }
 
+# 0. Argument Parsing for Yolo Mode
+local YOLO_MODE="0"
+local -a CLEAN_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "-y" || "$arg" == "--yolo" ]]; then
+    YOLO_MODE="1"
+  else
+    CLEAN_ARGS+=("$arg")
+  fi
+done
+set -- "${CLEAN_ARGS[@]}"
+
 # SSH 非登录 shell 常缺少 Homebrew PATH，先补常见路径
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
@@ -59,8 +71,9 @@ local UI_FZF_HEIGHT="40%"
 # ========================================
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "help" ]]; then
-  echo "Usage: cld [cp] [model_filter] [args...]"
+  echo "Usage: cld [cp] [model_filter] [-y] [args...]"
   echo "  cp: Connect to cliProxyAPI (Load Balanced)"
+  echo "  -y, --yolo: Skip permission prompts (Yolo Mode)"
   return 0
 fi
 
@@ -176,8 +189,7 @@ _get_proxy_models() {
   echo "sonnet4.6"
   echo "M2.5"
   echo "g3f"
-  echo "g3f.auto"
-  echo "g3p.auto"
+  echo "g3p"
   echo "g3i"
   echo "gpt5.3"
   echo "gpt5.2"
@@ -202,6 +214,7 @@ fi
 
 mkdir -p "$CACHE_DIR/$mode" >/dev/null 2>&1 || true
 local -a envs=()
+local goto_exec=""
 
 # 清理代理和认证变量，防止模式间污染
 envs+=(
@@ -354,40 +367,11 @@ case "$mode" in
       echo "$chosen_scenario" > "$last_scenario_file"
 
       if [[ "$chosen_scenario" != "Custom" ]]; then
-        local auto_upgrade_file="$cp_dir/last_auto_upgrade"
-        local last_auto_upgrade="Off"
-        [[ -f "$auto_upgrade_file" ]] && last_auto_upgrade="$(cat "$auto_upgrade_file")"
-        [[ "$last_auto_upgrade" != "On" ]] && last_auto_upgrade="Off"
-
-        local auto_upgrade_choice=""
-        local auto_upgrade_list=""
-        if [[ "$last_auto_upgrade" == "On" ]]; then
-          auto_upgrade_list=$'On\nOff\n'
-        else
-          auto_upgrade_list=$'Off\nOn\n'
-        fi
-
-        auto_upgrade_choice=$(echo "$auto_upgrade_list" | sed '/^$/d' | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Auto Upgrade (g3f.auto→opus4.6)" --prompt="Auto Upgrade (Last: $last_auto_upgrade)> ")
-        if [[ -z "$auto_upgrade_choice" ]]; then
-          auto_upgrade_choice="$last_auto_upgrade"
-          echo "   Using last auto-upgrade: $auto_upgrade_choice"
-        fi
-        echo "$auto_upgrade_choice" > "$auto_upgrade_file"
-
         local s_main="${scenario_main[$chosen_scenario]}"
         local s_fast="${scenario_fast[$chosen_scenario]}"
         local s_opus="${scenario_opus[$chosen_scenario]}"
 
-        if [[ "$auto_upgrade_choice" == "On" && ( "$s_main" == "g3f" || "$s_main" == "g3p" ) ]]; then
-          local auto_model="${s_main}.auto"
-          if echo "$avail_models" | grep -q "^${auto_model}$"; then
-            s_main="$auto_model"
-          else
-            echo "   Auto-upgrade model '$auto_model' not found, fallback to $s_main"
-          fi
-        fi
-
-        echo "📦 Scenario: $chosen_scenario (AutoUpgrade=$auto_upgrade_choice) → Main=$s_main  Fast=$s_fast  Opus=$s_opus"
+        echo "📦 Scenario: $chosen_scenario → Main=$s_main  Fast=$s_fast  Opus=$s_opus"
 
         envs+=( "${roles[main]}=$s_main" "${roles[fast]}=$s_fast" "${roles[opus]}=$s_opus" )
         envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$s_fast" )
@@ -458,6 +442,15 @@ case "$mode" in
       _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
     fi
 
+    # 4. Yolo Mode Interactive Selection
+    if [[ "$YOLO_MODE" == "0" && "$HAS_TTY" == "1" && "$goto_exec" != "true" ]]; then
+       local yolo_choice
+       yolo_choice=$(printf "No (Safe)\nYes (Yolo - Skip Permissions)" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Enable Yolo Mode?" --prompt="cld> " | awk '{print $1}')
+       if [[ "$yolo_choice" == "Yes" ]]; then
+         YOLO_MODE="1"
+       fi
+    fi
+
     # 提取 Main 模型名用于标题
     local main_model="${envs[(r)ANTHROPIC_MODEL=*]}"
     main_model="${main_model#*=}"
@@ -487,9 +480,15 @@ if [[ "$HAS_TTY" == "1" ]]; then
   tty_dev="$(tty 2>/dev/null || true)"
 fi
 
+local -a extra_args=()
+if [[ "$YOLO_MODE" == "1" ]]; then
+  echo "🔥 Yolo Mode Enabled: Skipping Permissions"
+  extra_args+=("--dangerously-skip-permissions")
+fi
+
 echo "▶ Launching claude..."
 if [[ "$HAS_TTY" == "1" && "$tty_dev" == /dev/* ]]; then
-  env "${envs[@]}" "$CLAUDE_CMD" "$@" <"$tty_dev" >"$tty_dev" 2>&1
+  env "${envs[@]}" "$CLAUDE_CMD" "${extra_args[@]}" "$@" <"$tty_dev" >"$tty_dev" 2>&1
 else
-  env "${envs[@]}" "$CLAUDE_CMD" "$@"
+  env "${envs[@]}" "$CLAUDE_CMD" "${extra_args[@]}" "$@"
 fi
