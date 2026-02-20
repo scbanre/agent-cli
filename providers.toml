@@ -11,59 +11,129 @@ streaming_keepalive_seconds = 15 # SSE 心跳（秒）
 streaming_bootstrap_retries = 1  # 流式首包前安全重试
 quota_switch_project = true      # 配额超限时自动切换账号/项目
 quota_switch_preview_model = true # 配额超限时可自动切 preview 模型
+request_log = true               # 详细请求/响应日志（用于对话分析）
+logs_max_total_size_mb = 102400  # 日志目录上限 100GB，超限自动删最旧文件
 lb_auth_cooldown_ms = 1800000    # LB 认证类错误冷却 30 分钟
 lb_validation_cooldown_ms = 43200000 # LB 验证类 403 冷却 12 小时
 lb_quota_cooldown_ms = 43200000  # LB 配额类错误冷却 12 小时
 lb_max_target_retries = 1        # LB 首包前最多自动切换重试次数
-lb_auto_upgrade_enabled = true
-lb_auto_upgrade_messages_threshold = 80
-lb_auto_upgrade_tools_threshold = 10
-lb_auto_upgrade_failure_streak_threshold = 2
-lb_auto_upgrade_signature_enabled = true
-
-[global.lb_auto_upgrade_map]
-"g3f.auto" = "opus4.6"
-"g3p.auto" = "opus4.6"
+lb_auto_upgrade_enabled = false
 
 [global.lb_model_router]
 enabled = true
-shadow_only = true
+shadow_only = false
 activation_models = ["auto", "auto-canary"]
-default_model = "g3f"
+default_model = "M2.5"
 log_factors = true
-# config_file = "router/agent-model-router.toml"
 
+# === 语义类别路由 (优先于阈值规则) ===
+[[global.lb_model_router.categories]]
+name = "architecture"
+priority = 500
+target_model = "opus4.6"
+signals = ["keyword:architect|design|system.*design|scalability", "system_tag:plan_mode"]
+
+[[global.lb_model_router.categories]]
+name = "code-review"
+priority = 400
+target_model = "gpt5.3"
+signals = ["keyword:review|audit|refactor|rewrite", "tool_profile:coding", "keyword:debug|排查|根因"]
+
+[[global.lb_model_router.categories]]
+name = "visual-coding"
+priority = 350
+target_model = "g3p"
+signals = ["keyword:frontend|前端|UI|CSS|tailwind|视觉|responsive|animation"]
+
+[[global.lb_model_router.categories]]
+name = "coding"
+priority = 300
+target_model = "sonnet4.6"
+signals = ["has_code_context:true", "tool_profile:coding"]
+
+[[global.lb_model_router.categories]]
+name = "explore"
+priority = 200
+target_model = "M2.5"
+signals = ["keyword:find|search|where|explain|what|how", "tool_profile:read", "tool_profile:explore"]
+
+[[global.lb_model_router.categories]]
+name = "quick"
+priority = 100
+target_model = "M2.5"
+signals = ["keyword:^(hi|hello|thanks|ok|hey)$", "messages_count:<=1"]
+
+# === 阈值规则 (categories 未命中时的 fallback) ===
+
+# ── T5: M2.5 — 故障恢复（跨 provider fallback）──
+# 注意：failure_reason 不可用于路由，failure_streak 只是累计计数。
+# failure_recovery 只在 categories 全部未命中时触发（rules 被 !hitRule 守卫）。
+# 未命中 category 的请求正常走 default_model=M2.5，故障时回退到同一目标即可。
+# M2.5 (official/MiniMax) 与 zenmux 完全跨 provider，无 thinking signature 问题。
+[[global.lb_model_router.rules]]
+name = "failure_recovery"
+priority = 500
+target_model = "M2.5"
+match = "any"
+[[global.lb_model_router.rules.when]]
+field = "failure_streak"
+op = ">="
+value = 2
+
+# ── T4: opus4.6 — 超长对话或大量工具 ──
 [[global.lb_model_router.rules]]
 name = "high_complexity"
-priority = 300
+priority = 400
 target_model = "opus4.6"
 match = "any"
-
 [[global.lb_model_router.rules.when]]
 field = "messages_count"
 op = ">="
-value = 40
-
+value = 50
 [[global.lb_model_router.rules.when]]
 field = "tools_count"
 op = ">="
-value = 8
+value = 10
 
+# ── T3: sonnet4.6 — 中高复杂度 ──
 [[global.lb_model_router.rules]]
-name = "medium_complexity"
-priority = 200
-target_model = "g3p.auto"
+name = "medium_high"
+priority = 300
+target_model = "sonnet4.6"
 match = "any"
-
 [[global.lb_model_router.rules.when]]
 field = "messages_count"
 op = ">="
-value = 18
+value = 25
+[[global.lb_model_router.rules.when]]
+field = "tools_count"
+op = ">="
+value = 6
+[[global.lb_model_router.rules.when]]
+field = "prompt_chars"
+op = ">="
+value = 15000
 
+# ── T2: M2.5 — 中等复杂度 ──
+[[global.lb_model_router.rules]]
+name = "medium"
+priority = 200
+target_model = "M2.5"
+match = "any"
+[[global.lb_model_router.rules.when]]
+field = "messages_count"
+op = ">="
+value = 10
 [[global.lb_model_router.rules.when]]
 field = "tools_count"
 op = ">="
 value = 3
+[[global.lb_model_router.rules.when]]
+field = "prompt_chars"
+op = ">="
+value = 5000
+
+# ── T1: M2.5 — 默认兜底（靠 default_model）──
 
 # ==========================================
 # 1. 物理实例定义 (Instances)
@@ -71,7 +141,7 @@ value = 3
 # ==========================================
 
 # --- 实例 A: Official (官方原生 Auth 聚合) ---
-# 包含 Gemini (Google) 和 OpenAI (Codex/ChatGPT)
+# 包含 Gemini (Google) 和 OpenAI (Codex/ChatGPT) + MiniMax
 # 均使用 OAuth 登录，无需在此填 Key
 [instances.official]
 port = 8146
@@ -86,6 +156,7 @@ providers = [
   # 需运行: ./cliproxy --codex-login
   { type = "codex", rotation_strategy = "round-robin" },
 
+  # 3. MiniMax (API Key)
   { type = "minimax", base_url = "https://api.minimaxi.com/anthropic", api_keys = [
     "${MINIMAX_KEY}",
   ] },
@@ -121,8 +192,7 @@ providers = [
 [routing]
 
 "opus4.6" = [
-  { instance = "official", provider = "gemini", model = "claude-opus-4-6-thinking", weight = 80, params = { "max_tokens_max" = 24000 } },
-  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "max_tokens_max" = 24000 } },
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 100, params = { "max_tokens_max" = 24000 } },
 ]
 
 "sonnet4.6" = [
@@ -130,27 +200,19 @@ providers = [
 ]
 
 "M2.5" = [
-  { instance = "official", provider = "minimax", model = "MiniMax-M2.5", weight = 80 },
+  { instance = "official", provider = "minimax", model = "MiniMax-M2.5", weight = 100, params = { "max_tokens_max" = 204800 } },
 ]
 
 "g3f" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
-  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
+  { instance = "official", provider = "gemini", model = "gemini-3-flash-preview", weight = 999, params = { "max_tokens_max" = 64000 } },
 ]
 
-"g3f.auto" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-flash", weight = 999, params = { "max_tokens_max" = 12000 } },
-  { instance = "zenmux", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1, params = { "max_tokens_max" = 12000 } },
-]
-
-"g3p.auto" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-pro-high", weight = 999, params = { "max_tokens_max" = 16000 } },
-  { instance = "zenmux", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "max_tokens_max" = 16000 } },
+"g3p" = [
+  { instance = "official", provider = "gemini", model = "gemini-3-pro-preview", weight = 999, params = { "thinking_level" = "high", "max_tokens_max" = 64000 } },
 ]
 
 "g3i" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-pro-image", weight = 999 },
-  { instance = "zenmux", provider = "gemini", model = "google/gemini-3-pro-image-preview", weight = 1 },
+  { instance = "official", provider = "gemini", model = "gemini-3-pro-image-preview", weight = 999 },
 ]
 
 "gpt5.3" = [
