@@ -506,14 +506,43 @@ function classifyToolProfile(body) {{
     if (!body || !Array.isArray(body.tools) || body.tools.length === 0) return 'none';
     const names = new Set();
     for (const tool of body.tools) {{
-        const name = tool?.function?.name;
-        if (typeof name === 'string') names.add(name);
+        const nameCandidates = [
+            tool?.function?.name,
+            tool?.name,
+            tool?.type
+        ];
+        for (const candidate of nameCandidates) {{
+            if (typeof candidate !== 'string') continue;
+            const normalized = candidate.trim().toLowerCase();
+            if (normalized) names.add(normalized);
+        }}
     }}
     if (names.size === 0) return 'none';
-    const hasCoding = names.has('Edit') || names.has('Write') || names.has('NotebookEdit');
-    const hasRead = names.has('Read') || names.has('Glob') || names.has('Grep');
-    const hasExplore = names.has('Task') || names.has('WebSearch') || names.has('WebFetch');
-    const hasOps = names.has('Bash');
+    const hasNameLike = (patterns) => {{
+        const arr = Array.isArray(patterns) ? patterns : [patterns];
+        for (const name of names) {{
+            for (const pattern of arr) {{
+                if (pattern instanceof RegExp) {{
+                    if (pattern.test(name)) return true;
+                }} else if (typeof pattern === 'string') {{
+                    if (name === pattern) return true;
+                }}
+            }}
+        }}
+        return false;
+    }};
+    const hasCoding = hasNameLike([
+        /^edit$/, /^write$/, /^notebookedit$/, /^apply_patch$/, /update/, /create/, /insert/, /replace/, /code/
+    ]);
+    const hasRead = hasNameLike([
+        /^read$/, /^glob$/, /^grep$/, /^find$/, /^search/, /list/, /query/, /fetch/
+    ]);
+    const hasExplore = hasNameLike([
+        /^task$/, /^websearch$/, /^webfetch$/, /browse/, /crawl/, /research/
+    ]);
+    const hasOps = hasNameLike([
+        /^bash$/, /^shell$/, /^terminal$/, /^exec_command$/, /^write_stdin$/, /git/, /deploy/, /pm2/
+    ]);
     const categories = [];
     if (hasCoding) categories.push('coding');
     if (hasRead && !hasCoding) categories.push('read');
@@ -522,6 +551,26 @@ function classifyToolProfile(body) {{
     if (categories.length > 1) return 'multi';
     if (categories.length === 1) return categories[0];
     return 'none';
+}}
+
+function classifyTaskCategory(body) {{
+    const text = extractLastUserMessageText(body);
+    if (typeof text !== 'string' || !text.trim()) return 'unknown';
+    const normalized = text.toLowerCase();
+    const patterns = [
+        ['architecture', /(architect|architecture|system\\s*design|scalability|technical\\s*design|架构|系统设计|可扩展)/i],
+        ['code-review', /(review|audit|refactor|rewrite|debug|root\\s*cause|排查|根因|代码审查|重构)/i],
+        ['visual-coding', /(frontend|ui|css|tailwind|responsive|animation|visual|前端|界面|样式|动画|视觉)/i],
+        ['coding', /(implement|write|fix|add|create|modify|code|bug|patch|script|函数|代码|修复|实现)/i],
+        ['explore', /(find|search|where|explain|what|how|lookup|research|trace|inspect|查找|搜索|解释|什么|如何)/i],
+        ['ops', /(deploy|restart|build|test|run|release|ci\\/?cd|运维|部署|发布|重启|构建)/i]
+    ];
+    for (const [category, regex] of patterns) {{
+        if (regex.test(normalized)) return category;
+    }}
+    const quick = normalized.trim();
+    if (/^(hi|hello|thanks|ok|hey|你好|谢谢|收到)$/.test(quick)) return 'quick';
+    return 'unknown';
 }}
 
 function detectCodeContext(body) {{
@@ -537,7 +586,10 @@ function detectCodeContext(body) {{
         else if (Array.isArray(content)) {{
             for (const block of content) {{
                 if (typeof block === 'string') text += block;
-                else if (block && typeof block.text === 'string') text += block.text;
+                else if (block && typeof block === 'object') {{
+                    if (typeof block.text === 'string') text += block.text;
+                    if (typeof block.input_text === 'string') text += block.input_text;
+                }}
             }}
         }}
         if (text && codePattern.test(text)) return true;
@@ -578,9 +630,11 @@ function buildModelRouterFactors(requestedModel, body, sessionKeyHash) {{
     const toolsCount = Array.isArray(body?.tools) ? body.tools.length : 0;
     const requested = typeof requestedModel === 'string' ? requestedModel : '';
     const health = getModelHealth(modelHealthKey(sessionKeyHash, requested));
+    const systemPromptType = classifySystemPromptType(body);
     return {{
         requested_model: requested || null,
         messages_count: messagesCount,
+        conversation_depth: messagesCount,
         tools_count: toolsCount,
         has_thinking_signature: hasThinkingSignature(body),
         has_system_prompt: hasSystemPrompt(body),
@@ -588,9 +642,11 @@ function buildModelRouterFactors(requestedModel, body, sessionKeyHash) {{
         failure_streak: health.failureStreak || 0,
         success_streak: health.successStreak || 0,
         last_user_text: extractLastUserMessageText(body),
+        task_category: classifyTaskCategory(body),
         tool_profile: classifyToolProfile(body),
         has_code_context: detectCodeContext(body),
-        system_prompt_tags: classifySystemPromptType(body)
+        system_prompt_type: systemPromptType,
+        system_prompt_tags: systemPromptType
     }};
 }}
 
@@ -707,7 +763,7 @@ function evaluateCategorySignal(signal, factors) {{
     if (typeof signal !== 'string') return false;
     const colonIdx = signal.indexOf(':');
     if (colonIdx < 0) return false;
-    const type = signal.slice(0, colonIdx).trim();
+    const type = signal.slice(0, colonIdx).trim().toLowerCase();
     const value = signal.slice(colonIdx + 1).trim();
     switch (type) {{
         case 'keyword': {{
@@ -719,12 +775,33 @@ function evaluateCategorySignal(signal, factors) {{
                 return false;
             }}
         }}
+        case 'task_category':
+            return String(factors.task_category || '').toLowerCase() === value.toLowerCase();
         case 'tool_profile':
-            return factors.tool_profile === value;
+            return String(factors.tool_profile || '').toLowerCase() === value.toLowerCase();
         case 'has_code_context':
-            return String(!!factors.has_code_context) === value;
+            return String(!!factors.has_code_context) === value.toLowerCase();
+        case 'system_prompt_type':
         case 'system_tag':
-            return Array.isArray(factors.system_prompt_tags) && factors.system_prompt_tags.includes(value);
+            return Array.isArray(factors.system_prompt_type)
+                ? factors.system_prompt_type.includes(value)
+                : Array.isArray(factors.system_prompt_tags) && factors.system_prompt_tags.includes(value);
+        case 'conversation_depth': {{
+            const factorVal = toFiniteNumber(factors.messages_count);
+            if (factorVal == null) return false;
+            const opMatch = value.match(/^(<=|>=|<|>|==|!=)(\\d+(?:\\.\\d+)?)$/);
+            if (!opMatch) return false;
+            const op = opMatch[1];
+            const threshold = Number(opMatch[2]);
+            if (!Number.isFinite(threshold)) return false;
+            if (op === '<=') return factorVal <= threshold;
+            if (op === '>=') return factorVal >= threshold;
+            if (op === '<') return factorVal < threshold;
+            if (op === '>') return factorVal > threshold;
+            if (op === '==') return factorVal === threshold;
+            if (op === '!=') return factorVal !== threshold;
+            return false;
+        }}
         case 'messages_count':
         case 'prompt_chars': {{
             const factorVal = toFiniteNumber(factors[type]);

@@ -31,37 +31,37 @@ log_factors = true
 name = "architecture"
 priority = 500
 target_model = "opus4.6"
-signals = ["keyword:architect|design|system.*design|scalability", "system_tag:plan_mode"]
+signals = ["task_category:architecture", "system_prompt_type:plan_mode", "keyword:architect|design|system.*design|scalability"]
 
 [[global.lb_model_router.categories]]
 name = "code-review"
 priority = 400
 target_model = "gpt5.3"
-signals = ["keyword:review|audit|refactor|rewrite", "tool_profile:coding", "keyword:debug|排查|根因"]
+signals = ["task_category:code-review", "system_prompt_type:review", "keyword:review|audit|refactor|rewrite", "keyword:debug|排查|根因"]
 
 [[global.lb_model_router.categories]]
 name = "visual-coding"
 priority = 350
 target_model = "g3p"
-signals = ["keyword:frontend|前端|UI|CSS|tailwind|视觉|responsive|animation"]
+signals = ["task_category:visual-coding", "keyword:frontend|前端|UI|CSS|tailwind|视觉|responsive|animation"]
 
 [[global.lb_model_router.categories]]
 name = "coding"
 priority = 300
 target_model = "sonnet4.6"
-signals = ["has_code_context:true", "tool_profile:coding"]
+signals = ["task_category:coding", "has_code_context:true", "tool_profile:coding"]
 
 [[global.lb_model_router.categories]]
 name = "explore"
 priority = 200
 target_model = "M2.5"
-signals = ["keyword:find|search|where|explain|what|how", "tool_profile:read", "tool_profile:explore"]
+signals = ["task_category:explore", "keyword:find|search|where|explain|what|how", "tool_profile:read", "tool_profile:explore"]
 
 [[global.lb_model_router.categories]]
 name = "quick"
 priority = 100
 target_model = "M2.5"
-signals = ["keyword:^(hi|hello|thanks|ok|hey)$", "messages_count:<=1"]
+signals = ["task_category:quick", "keyword:^(hi|hello|thanks|ok|hey)$", "messages_count:<=1"]
 
 # === 阈值规则 (categories 未命中时的 fallback) ===
 
