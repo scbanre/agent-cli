@@ -1,5 +1,11 @@
 # feat(lb): 配置驱动自动选模（让 Claude Code 仅作前端）
 
+> ⚠ 历史问题记录（已过时）
+> 本文用于记录配置驱动选模的落地过程，不代表当前生产配置。
+> 当前真值请以 `/Volumes/ext/env/cliproxyapi/providers.toml` 为准。
+> 现行说明文档：`/Volumes/ext/env/docs/cliproxyapi.md`、`/Volumes/ext/env/cliproxyapi/docs/agent/shared/providers-toml.md`。
+> 标记日期：2026-02-23
+
 ## 背景
 
 当前模型选择逻辑仍有前端参与，且部分自动选模阈值在代码中固化。  
