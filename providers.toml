@@ -42,7 +42,7 @@ signals = ["task_category:code-review", "system_prompt_type:review", "keyword:re
 [[global.lb_model_router.categories]]
 name = "visual-coding"
 priority = 350
-target_model = "g3p"
+target_model = "sonnet4.6"
 signals = ["task_category:visual-coding", "keyword:frontend|前端|UI|CSS|tailwind|视觉|responsive|animation"]
 
 [[global.lb_model_router.categories]]
@@ -203,17 +203,6 @@ providers = [
   { instance = "official", provider = "minimax", model = "MiniMax-M2.5", weight = 100, params = { "max_tokens_max" = 204800 } },
 ]
 
-"g3f" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-flash-preview", weight = 999, params = { "max_tokens_max" = 64000 } },
-]
-
-"g3p" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-pro-preview", weight = 999, params = { "thinking_level" = "high", "max_tokens_max" = 64000 } },
-]
-
-"g3i" = [
-  { instance = "official", provider = "gemini", model = "gemini-3-pro-image-preview", weight = 999 },
-]
 
 "gpt5.3" = [
   { instance = "official", provider = "codex", model = "gpt-5.3-codex", weight = 1, params = { "reasoning_effort" = "high" } },
