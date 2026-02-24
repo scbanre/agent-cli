@@ -1,46 +1,35 @@
-# cliProxyAPI
+# AGENTS.md
 
-多后端 AI API 聚合网关，按 model 名 + 权重路由到不同实例。
+`cliproxyapi/source_code/` 是网关代码仓（配置生成、路由策略、统计脚本）。
 
-```text
-客户端请求 -> LB (8145) -> 物理实例 (8146/8147) -> 上游 API
-```
+## L0 快速规则
 
-## 核心文件
+- 不直接修改生成产物（`lb.js`、`instances/*.yaml`、`ecosystem.config.js`）。
+- 配置源始终是上层 `../providers.toml`。
+- 本地部署重载从上层执行 `../reload_proxy.sh`。
 
-| 文件 | 说明 |
-|------|------|
-| `providers.toml` | 主配置：实例定义 + 路由规则 |
-| `generate_config.py` | 配置生成器：TOML -> YAML + LB + PM2 |
-| `cld` | 客户端启动脚本（FZF 选模型） |
-| `.env` | API Keys（不提交） |
-
-## 常用命令
+## 高频命令
 
 ```bash
-python3 generate_config.py          # 生成配置
-pm2 start ecosystem.config.js       # 启动
-pm2 restart all                     # 重启
-pm2 logs                            # 查看日志
-./cliproxy --antigravity-login      # OAuth 登录 (Google)
-./cliproxy --codex-login            # OAuth 登录 (OpenAI)
+python3 ../generate_config.py
+../reload_proxy.sh
+pm2 status
+pm2 logs
 ```
 
-## 变更流程
+## 典型流程
 
-**添加/修改模型路由**: 编辑 `providers.toml` -> `python3 generate_config.py` -> `pm2 restart all`
+1. 修改 `../providers.toml`
+2. 运行 `python3 ../generate_config.py`
+3. 运行 `../reload_proxy.sh`
+4. 用 `pm2 status` 与一次接口请求做验收
 
-**添加新后端**: 在 `[instances.xxx]` 新增实例 -> 在 `[routing]` 引用 -> 生成配置并重启
+## 深入文档
 
-## 按需查阅
+- `docs/agent/shared/providers-toml.md`
+- `docs/agent/shared/runbook-reload-and-auth.md`
+- `docs/agent/shared/development-notes.md`
 
-| 需求 | 文档 |
-|------|------|
-| providers.toml 完整语法 | `docs/agent/shared/providers-toml.md` |
-| 端口分配 / 生成文件 | `docs/agent/shared/providers-toml.md` |
-| cld tier 映射 | `docs/agent/shared/providers-toml.md` |
+## 备注
 
-## 文档同步
-
-修改 `CLAUDE.md` / `AGENTS.md` 的共享规则时，必须同步更新另一份。
-仅 "专用" 标记的段落可以不同。
+本目录遵循根仓治理：`AGENTS.md` 单一真源，`CLAUDE.md/GEMINI.md` 使用软链接。

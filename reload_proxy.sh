@@ -9,6 +9,8 @@ if [[ "${1:-}" == "--logs" ]]; then
   SHOW_LOGS=1
 fi
 
+RELOAD_TIMEOUT_SECONDS="${RELOAD_TIMEOUT_SECONDS:-40}"
+
 PM2_CMD=()
 if command -v pm2 >/dev/null 2>&1; then
   PM2_CMD=(pm2)
@@ -31,21 +33,106 @@ if [[ ! -f "generate_config.py" ]]; then
   exit 1
 fi
 
+# 从 .env 注入运行时环境（用于 providers.toml 的 ${CLIPROXY_PROXY} 模板替换）。
+if [[ -f ".env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ".env"
+  set +a
+fi
+
+# 不向服务进程注入全局 HTTP(S)_PROXY，避免影响请求路由。
+# 显式清空历史代理环境变量，确保 PM2 --update-env 覆盖旧值。
+export HTTP_PROXY=""
+export HTTPS_PROXY=""
+export ALL_PROXY=""
+export http_proxy=""
+export https_proxy=""
+export all_proxy=""
+# 清理来自 Codex/Claude CLI 的会话级环境变量，避免将“沙箱禁网”等状态注入 PM2 子进程。
+while IFS="=" read -r _env_key _; do
+  case "$_env_key" in
+    CODEX_*|CLAUDE_*|CLD_*|CLAUDECODE) unset "$_env_key" ;;
+  esac
+done < <(env)
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "错误: 未找到 node。无法解析 ecosystem.config.js" >&2
+  exit 1
+fi
+
+run_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+  local -a cmd=("$@")
+
+  "${cmd[@]}" &
+  local cmd_pid=$!
+  local start_ts
+  start_ts="$(date +%s)"
+
+  while kill -0 "$cmd_pid" >/dev/null 2>&1; do
+    local now_ts
+    now_ts="$(date +%s)"
+    if (( now_ts - start_ts >= timeout_seconds )); then
+      echo "警告: 命令执行超时 (${timeout_seconds}s): ${cmd[*]}" >&2
+      kill "$cmd_pid" >/dev/null 2>&1 || true
+      sleep 1
+      kill -9 "$cmd_pid" >/dev/null 2>&1 || true
+      wait "$cmd_pid" >/dev/null 2>&1 || true
+      return 124
+    fi
+    sleep 1
+  done
+
+  wait "$cmd_pid"
+}
+
 echo "[1/2] 生成配置..."
 python3 generate_config.py
 
 echo "[2/2] 重启服务..."
-if ! "${PM2_CMD[@]}" restart all; then
-  if [[ -f "ecosystem.config.js" ]]; then
-    echo "未检测到可重启进程，尝试首次启动 ecosystem.config.js ..."
-    "${PM2_CMD[@]}" start ecosystem.config.js
-  else
-    echo "错误: pm2 restart all 失败，且未找到 ecosystem.config.js" >&2
-    exit 1
+if [[ ! -f "ecosystem.config.js" ]]; then
+  echo "错误: 未找到 ecosystem.config.js" >&2
+  exit 1
+fi
+
+TARGET_APPS=()
+while IFS= read -r app_name; do
+  [[ -n "$app_name" ]] && TARGET_APPS+=("$app_name")
+done < <(
+  node -e '
+    const cfg = require(process.argv[1]);
+    const apps = Array.isArray(cfg.apps) ? cfg.apps : [];
+    for (const app of apps) {
+      if (app && app.name) console.log(app.name);
+    }
+  ' "$SCRIPT_DIR/ecosystem.config.js"
+)
+
+if [[ "${#TARGET_APPS[@]}" -eq 0 ]]; then
+  echo "错误: ecosystem.config.js 中未解析到任何应用名称" >&2
+  exit 1
+fi
+
+APP_LIST_CSV="$(IFS=,; echo "${TARGET_APPS[*]}")"
+
+do_reload() {
+  run_with_timeout "$RELOAD_TIMEOUT_SECONDS" "${PM2_CMD[@]}" startOrRestart ecosystem.config.js --update-env
+}
+
+if ! do_reload; then
+  echo "检测到 PM2 重载失败或超时，尝试自愈: pm2 kill + pm2 resurrect ..." >&2
+  "${PM2_CMD[@]}" kill || true
+  "${PM2_CMD[@]}" resurrect || true
+
+  if ! do_reload; then
+    echo "二次重载仍失败，尝试仅按当前 ecosystem 启动目标应用: ${APP_LIST_CSV}" >&2
+    run_with_timeout "$RELOAD_TIMEOUT_SECONDS" "${PM2_CMD[@]}" start ecosystem.config.js --only "$APP_LIST_CSV" --update-env
   fi
 fi
 
-echo "完成: 配置已更新并重启。"
+echo "完成: 配置已更新并按 ecosystem 应用列表重载。"
 "${PM2_CMD[@]}" status
 
 if [[ "$SHOW_LOGS" -eq 1 ]]; then

@@ -1,14 +1,17 @@
 # providers.toml 配置说明
 
-`providers.toml` 是本仓库的统一编排入口：它不替代 `cliproxyapi` 的核心代理能力，而是把多实例路由、LB 与 PM2 运行配置收敛到一份声明式配置中。
+`providers.toml` 是本仓库的统一编排入口：实例定义、聚合路由、LB 规则均从这里生成到 `instances/*.yaml`、`lb.js`、`ecosystem.config.js`。
 
-## 1. 全局配置
+> 基线日期：2026-02-23
+> 真值来源：`/Volumes/ext/env/cliproxyapi/providers.toml`
+
+## 1. 全局配置（当前默认）
 
 ```toml
 [global]
 host = "0.0.0.0"
-main_port = 8145        # LB 对外端口
-proxy = "http://..."    # 可选代理
+main_port = 8145
+proxy = "${CLIPROXY_PROXY}"
 request_retry = 3
 max_retry_interval = 30
 nonstream_keepalive_interval = 5
@@ -16,121 +19,137 @@ streaming_keepalive_seconds = 15
 streaming_bootstrap_retries = 1
 quota_switch_project = true
 quota_switch_preview_model = true
-lb_auto_upgrade_enabled = true
-lb_retry_auth_on_5xx = false
-lb_auto_upgrade_messages_threshold = 80
-lb_auto_upgrade_tools_threshold = 10
-lb_auto_upgrade_failure_streak_threshold = 2
-lb_auto_upgrade_signature_enabled = true
+lb_auth_cooldown_ms = 1800000
+lb_validation_cooldown_ms = 43200000
+lb_quota_cooldown_ms = 43200000
+lb_max_target_retries = 1
+lb_auto_upgrade_enabled = false
 ```
 
-- `request_retry` / `max_retry_interval`: 实例默认重试策略（可被 `[instances.xxx]` 覆盖）
-- `nonstream_keepalive_interval`: 非流式请求保活间隔（秒）
-- `streaming_keepalive_seconds` / `streaming_bootstrap_retries`: 流式心跳与首包前安全重试
-- `quota_switch_project` / `quota_switch_preview_model`: 配额超限时的自动切换策略
-- `lb_retry_auth_on_5xx`: 是否允许认证类 5xx 在 LB 层跨后端重试（默认关闭，避免 `auth_unavailable` 循环）
-- `lb_auto_upgrade_*`: LB 自动升档阈值开关（按请求复杂度与失败连击）
+- `request_retry` / `max_retry_interval`: 默认重试策略，可被实例覆盖
+- `nonstream_keepalive_interval` / `streaming_keepalive_seconds`: 保活与心跳
+- `lb_*_cooldown_ms`: LB 侧冷却窗口
+- `lb_auto_upgrade_enabled = false`: 当前默认关闭自动升档
 
-可选模型升档映射（常用于 `g3f.auto -> opus4.6`）：
+## 2. 历史兼容项（非默认）
+
+以下配置在部分历史分支/实验配置中出现，当前生产基线不启用：
+
+- `lb_auto_upgrade_messages_threshold`
+- `lb_auto_upgrade_tools_threshold`
+- `lb_auto_upgrade_failure_streak_threshold`
+- `lb_auto_upgrade_signature_enabled`
+- `[global.lb_auto_upgrade_map]`（例如 `"g3f.auto" = "opus4.6"`）
+
+使用这些项时请在文档中明确标注“实验/兼容”，避免误解为现网默认。
+
+## 3. model_router（当前默认开启）
 
 ```toml
-[global.lb_auto_upgrade_map]
-"g3f.auto" = "opus4.6"
+[global.lb_model_router]
+enabled = true
+shadow_only = false
+activation_models = ["auto", "auto-canary"]
+default_model = "M2.5"
+log_factors = true
 ```
 
-## 2. 物理实例
+### 执行顺序
+
+`categories`（语义分类）→ `rules`（阈值 fallback）→ `default_model`
+
+- categories 按 `priority` 降序，首个命中即停止
+- category 的 `signals` 为 OR 关系
+- rules 仅在 category 未命中时执行
+
+### categories（当前生效）
+
+| category | priority | target_model | signals（节选） |
+|----------|----------|--------------|-----------------|
+| `architecture` | 500 | `opus4.6` | `task_category:architecture`, `system_prompt_type:plan_mode` |
+| `code-review` | 400 | `gpt5.3` | `task_category:code-review`, `system_prompt_type:review` |
+| `visual-coding` | 350 | `g3p` | `task_category:visual-coding`, `keyword:frontend\|UI\|CSS` |
+| `coding` | 300 | `sonnet4.6` | `task_category:coding`, `has_code_context:true`, `tool_profile:coding` |
+| `explore` | 200 | `M2.5` | `task_category:explore`, `tool_profile:read`, `tool_profile:explore` |
+| `quick` | 100 | `M2.5` | `task_category:quick`, `messages_count:<=1` |
+
+### rules（当前生效）
+
+| rule | priority | target_model | 条件 |
+|------|----------|--------------|------|
+| `failure_recovery` | 500 | `M2.5` | `failure_streak >= 2` |
+| `high_complexity` | 400 | `opus4.6` | `messages_count >= 50` 或 `tools_count >= 10` |
+| `medium_high` | 300 | `sonnet4.6` | `messages_count >= 25` 或 `tools_count >= 6` 或 `prompt_chars >= 15000` |
+| `medium` | 200 | `M2.5` | `messages_count >= 10` 或 `tools_count >= 3` 或 `prompt_chars >= 5000` |
+
+### Signal 字段
+
+| 字段 | 格式 | 说明 |
+|------|------|------|
+| `keyword` | `keyword:<regex>` | 用户消息关键词匹配 |
+| `task_category` | `task_category:<name>` | 语义分类结果匹配 |
+| `tool_profile` | `tool_profile:<name>` | 工具画像匹配 |
+| `has_code_context` | `has_code_context:true\|false` | 是否检测到代码上下文 |
+| `system_prompt_type` | `system_prompt_type:<tag>` | system prompt 类型（主字段） |
+| `system_tag` | `system_tag:<tag>` | `system_prompt_type` 的兼容别名 |
+| `messages_count` | `messages_count:<op><value>` | 数值阈值 |
+| `prompt_chars` | `prompt_chars:<op><value>` | 数值阈值 |
+
+## 4. 物理实例与 provider
 
 ```toml
 [instances.official]
 port = 8146
-request_retry = 1
-max_retry_interval = 5
 providers = [
-  { type = "antigravity", rotation_strategy = "round-robin" },
+  { type = "gemini", rotation_strategy = "round-robin" },
   { type = "codex", rotation_strategy = "round-robin" },
+  { type = "minimax", base_url = "https://api.minimaxi.com/anthropic", api_keys = ["${MINIMAX_KEY}"] },
 ]
 
 [instances.zenmux]
 port = 8147
 providers = [
-  { type = "openai", base_url = "...", api_keys = ["${ZENMUX_KEY}"] },
+  { type = "openai", base_url = "https://zenmux.ai/api/v1", api_keys = ["${ZENMUX_KEY}"] },
+  { type = "anthropic", base_url = "https://zenmux.ai/api/anthropic", api_keys = ["${ZENMUX_KEY}"] },
+  { type = "gemini", base_url = "https://zenmux.ai/api/vertex-ai", api_keys = ["${ZENMUX_KEY}"] },
 ]
 ```
 
-- `request_retry` / `max_retry_interval` / `disable_cooling` / `routing_strategy` 支持实例级覆盖
-- `streaming` 与 `quota_exceeded` 也支持实例级 table 覆盖（例如 `[instances.official.streaming]`）
+`routing` 中每个目标的 `provider` 必须与实例内 provider type 一致，否则会报 `unknown provider for model ...`。
 
-## 3. 路由规则
+## 5. 路由示例（当前 tier）
 
 ```toml
 [routing]
-"opus4.5" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-5-thinking", weight = 80 },
-  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.5", weight = 20 },
-]
-```
-
-- `weight`: 权重越大，命中概率越高
-- `provider`: 必须匹配实例中定义的 provider type，否则报 `unknown provider for model ...`
-- `params`: 可选，按路由目标注入请求参数（由 `generate_config.py` 生成的 `lb.js` 在转发时应用）
-
-## 4. 路由 params（可选）
-
-常见可用参数：
-
-- `reasoning_effort`: 例如 `low` / `medium` / `high`
-- `thinking_budget_max`: 限制 `thinking.budget_tokens` 的上限，避免后端把过大预算映射到不支持的等级
-- `max_tokens_max`: 限制 `max_tokens` 上限，降低超长输出导致的延迟与费用
-- `max_tokens_default`: 客户端未传 `max_tokens` 时补默认值
-- `anthropic_beta`: 追加到 `anthropic-beta` 请求头（会与客户端已有值去重合并）
-- `extra_headers`: 注入额外请求头（键名不区分大小写；会忽略 `content-length` / `host`）
-
-Gemini 3 Pro relay 推荐写法：
-
-```toml
-"gemini-pro" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-pro-high", weight = 999 },
-  { instance = "relay", provider = "openai", model = "google/gemini-3-pro-preview", weight = 1, params = { "reasoning_effort" = "high", "thinking_budget_max" = 24576 } },
-]
-```
-
-自动升档别名示例：
-
-```toml
-"g3f.auto" = [
-  { instance = "official", provider = "antigravity", model = "gemini-3-flash", weight = 999 },
-  { instance = "relay", provider = "openai", model = "google/gemini-3-flash-preview", weight = 1 },
-]
-```
-
-Claude 1M 上下文（可选，默认不加）示例：
-
-```toml
 "opus4.6" = [
-  { instance = "official", provider = "antigravity", model = "claude-opus-4-6-thinking", weight = 80, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
-  { instance = "relay", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 20, params = { "anthropic_beta" = "context-1m-2025-08-07" } },
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-opus-4.6", weight = 100, params = { "max_tokens_max" = 24000 } },
+]
+"sonnet4.6" = [
+  { instance = "zenmux", provider = "anthropic", model = "anthropic/claude-sonnet-4.6", weight = 100, params = { "max_tokens_max" = 16000 } },
+]
+"M2.5" = [
+  { instance = "official", provider = "minimax", model = "MiniMax-M2.5", weight = 100, params = { "max_tokens_max" = 204800 } },
+]
+"gpt5.3" = [
+  { instance = "official", provider = "codex", model = "gpt-5.3-codex", weight = 1, params = { "reasoning_effort" = "high" } },
 ]
 ```
 
-## 5. 端口分配
+常用 `params`：`reasoning_effort`、`max_tokens_max`、`max_tokens_default`、`anthropic_beta`、`extra_headers`。
 
-| 端口 | 服务 |
-|------|------|
-| 8145 | 主入口 LB (lb.js) |
-| 8146 | official 实例 (OAuth) |
-| 8147 | zenmux 实例 (API Key) |
+## 6. auto 统计口径
 
-## 6. 生成文件 (gitignore)
+- `by_auto_model_category`: key 为 `resolved_model × category`
+- `by_auto_category` 可能出现特殊值：
+- `(non_category)`: 未命中 category，转 rules/default
+- `(not_activated)`: decision 为 `not_activated`
+- `(unknown)`: category 名为空或无法解析
 
-| 文件 | 说明 |
-|------|------|
-| `instances/*.yaml` | 各物理实例的 cliproxy 配置 |
-| `lb.js` | Node.js 负载均衡器 |
-| `ecosystem.config.js` | PM2 进程配置 |
-| `cliproxy` | 编译的二进制文件 |
+## 7. 生成与重载
 
-## 7. cld 模型 Tier 映射
-
-`cld` 脚本通过环境变量预设模型映射，Claude Code 的 Task 工具通过 `model` 参数选择 tier，实际请求经 cliproxyapi 路由到对应后端。
-
-映射关系在 `cld` 脚本中维护，随时可能变更，以脚本实际配置为准。
+```bash
+python3 generate_config.py
+./reload_proxy.sh
+pm2 status
+pm2 logs
+```

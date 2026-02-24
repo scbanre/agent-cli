@@ -7,30 +7,73 @@
 
 _die() { echo "❌ $1"; }
 
+# 0. Argument Parsing for Yolo Mode
+local YOLO_MODE="0"
+local -a CLEAN_ARGS=()
+for arg in "$@"; do
+  if [[ "$arg" == "-y" || "$arg" == "--yolo" ]]; then
+    YOLO_MODE="1"
+  else
+    CLEAN_ARGS+=("$arg")
+  fi
+done
+set -- "${CLEAN_ARGS[@]}"
+
+# SSH 非登录 shell 常缺少 Homebrew PATH，先补常见路径
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# SSH 非交互场景（如 `ssh host cld`）没有 tty，不能走 fzf 交互
+local HAS_TTY="0"
+if [[ -t 0 && -t 1 && "${TERM:-}" != "dumb" ]]; then
+  HAS_TTY="1"
+fi
+
 # 依赖检查
-command -v claude >/dev/null 2>&1 || { _die "未找到 claude 命令"; return 1; }
-command -v fzf    >/dev/null 2>&1 || { _die "未安装 fzf"; return 1; }
+local CLAUDE_CMD="${CLD_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+if [[ -z "$CLAUDE_CMD" ]]; then
+  for cand in /opt/homebrew/bin/claude /usr/local/bin/claude; do
+    if [[ -x "$cand" ]]; then
+      CLAUDE_CMD="$cand"
+      break
+    fi
+  done
+fi
+[[ -z "$CLAUDE_CMD" ]] && { _die "未找到 claude 命令"; return 1; }
+if [[ "$HAS_TTY" == "1" ]]; then
+  local FZF_CMD="$(command -v fzf 2>/dev/null || true)"
+  [[ -z "$FZF_CMD" ]] && [[ -x /opt/homebrew/bin/fzf ]] && FZF_CMD="/opt/homebrew/bin/fzf"
+  [[ -z "$FZF_CMD" ]] && [[ -x /usr/local/bin/fzf ]] && FZF_CMD="/usr/local/bin/fzf"
+  [[ -z "$FZF_CMD" ]] && { _die "未安装 fzf"; return 1; }
+fi
 
 # ================= 配置 =================
-local PROXY_BASE="http://127.0.0.1:8145"
-local PROXY_KEY="dummy-key"  # 网关鉴权主要靠内部配置，这里传 dummy 即可
+# 支持环境变量覆盖
+local PROXY_BASE="${CLD_PROXY_BASE:-http://127.0.0.1:8145}"
+local PROXY_KEY="${CLD_PROXY_KEY:-}"  # 优先读环境变量，默认空
 
-local AG_BASE="${ANTI_API_BASE:-http://127.0.0.1:8045/v1}"
-local AG_KEY="${ANTI_API_TOKEN:-}"
+# 检测是否已认证（通过是否存在 .claude.json）
+_is_authenticated() {
+  local cp_dir="${1:-$CACHE_DIR/cp}"
+  [[ -f "$cp_dir/.claude.json" ]]
+}
 
-# AG 模型配置
-local AG_CODE_MODEL="${CLD_AG_CODE_MODEL:-claude-opus-4-6-thinking}"
-local AG_DOC_MODEL="${CLD_AG_DOC_MODEL:-gemini-3-pro-high}"
-local AG_FAST_MODEL="${CLD_AG_FAST_MODEL:-gemini-3-flash}"
+# 是否设置自定义 BASE_URL（已认证则设置，未认证则不设置让客户端直连官方认证）
+_would_use_base_url() {
+  local cp_dir="$CACHE_DIR/cp"
+  if [[ "$CLD_USE_BASE_URL" == "false" ]]; then
+    return 1
+  fi
+  _is_authenticated "$cp_dir"
+}
 
 local CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cld"
 local UI_FZF_HEIGHT="40%"
 # ========================================
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "help" ]]; then
-  echo "Usage: cld [cp|ag] [model_filter] [args...]"
+  echo "Usage: cld [cp] [model_filter] [-y] [args...]"
   echo "  cp: Connect to cliProxyAPI (Load Balanced)"
-  echo "  ag: Connect to Antigravity directly (Debug)"
+  echo "  -y, --yolo: Skip permission prompts (Yolo Mode)"
   return 0
 fi
 
@@ -46,15 +89,95 @@ _set_title() {
   fi
 }
 
+_healthcheck_proxy_base() {
+  local base="$(_norm_base "$1")"
+  local url="${base}/v1/models"
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -m 3 "$url" >/dev/null 2>&1
+}
+
 # 获取可用模型列表
-# 优先从 CLD_TOML 环境变量指定的 TOML 文件读取，否则返回内置列表
+# 优先从 CLD_TOML 环境变量指定的 TOML 文件读取；未指定时自动探测 providers.toml
 # 内置列表由 deploy_cld.sh 在部署时从 providers.toml 烘焙
+_resolve_toml_file() {
+  local env_toml="${CLD_TOML:-}"
+  if [[ -n "$env_toml" && -f "$env_toml" ]]; then
+    echo "$env_toml"
+    return 0
+  fi
+
+  local -a candidates=()
+  local src_path=""
+
+  # zsh autoload/function 场景：优先从函数来源路径探测
+  if [[ -n "${funcfiletrace[1]:-}" ]]; then
+    src_path="${funcfiletrace[1]%:*}"
+    if [[ -n "$src_path" ]]; then
+      candidates+=(
+        "${src_path:A:h}/providers.toml"
+        "${src_path:A:h}/../providers.toml"
+      )
+    fi
+  fi
+
+  # 直接执行脚本场景
+  if [[ -n "${0:-}" && "${0}" != "zsh" && "${0}" != "-zsh" ]]; then
+    candidates+=("${0:A:h}/providers.toml")
+  fi
+
+  # 常见工作目录
+  candidates+=(
+    "$PWD/providers.toml"
+    "$PWD/../providers.toml"
+  )
+
+  local path=""
+  for path in "${candidates[@]}"; do
+    if [[ -f "$path" ]]; then
+      echo "$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# 从 TOML 读取 proxy 配置
+_get_proxy_config() {
+  local toml="$(_resolve_toml_file 2>/dev/null || true)"
+  if [[ -n "$toml" && -f "$toml" ]]; then
+    local port proxy_url
+    port=$(awk '/^main_port[[:space:]]*=/ { gsub(/[[:space:]]*/, "", $3); print $3; exit }' "$toml")
+    proxy_url=$(awk '/^proxy[[:space:]]*=/ { gsub(/[[:space:]]*"/, "", $3); gsub(/".*$/, "", $3); print $3; exit }' "$toml")
+    if [[ -n "$port" ]]; then
+      echo "http://127.0.0.1:${port}"
+      return
+    fi
+    if [[ -n "$proxy_url" ]]; then
+      echo "$proxy_url"
+      return
+    fi
+  fi
+  # 默认值
+  echo "http://127.0.0.1:8145"
+}
+
 _get_proxy_models() {
-  # 如果指定了 TOML 文件，动态解析
-  local toml="${CLD_TOML:-}"
+  local toml="$(_resolve_toml_file 2>/dev/null || true)"
   if [[ -n "$toml" && -f "$toml" ]]; then
     local models
-    models=$(sed -n '/^\[routing\]/,/^\[.*\]/p' "$toml" | grep '^[[:space:]]*"' | cut -d'"' -f2)
+    models=$(awk '
+      /^\[routing\][[:space:]]*$/ { in_routing = 1; next }
+      /^\[[^]]+\][[:space:]]*$/ {
+        if (in_routing) exit
+      }
+      in_routing && $0 ~ /^[[:space:]]*"/ {
+        line = $0
+        sub(/^[[:space:]]*"/, "", line)
+        sub(/".*$/, "", line)
+        print line
+      }
+    ' "$toml")
     if [[ -n "$models" ]]; then
       echo "$models"
       return
@@ -63,8 +186,10 @@ _get_proxy_models() {
 
   # --- BEGIN MODELS ---
   echo "opus4.6"
-  echo "g3p"
+  echo "sonnet4.6"
+  echo "M2.5"
   echo "g3f"
+  echo "g3p"
   echo "g3i"
   echo "gpt5.3"
   echo "gpt5.2"
@@ -73,22 +198,29 @@ _get_proxy_models() {
 
 local mode=""
 # 1. 模式选择 (如果没有参数)
-if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "ag" || "${1:-}" == "official") ]]; then
+if [[ -n "${1:-}" && ("${1:-}" == "cp" || "${1:-}" == "official") ]]; then
   mode="$1"
   shift 1
 else
-  # 交互式选择模式
-  mode="$(printf "cp (Custom Proxy)\nag (Antigravity Direct)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
-  [[ -z "$mode" ]] && return 0
+  if [[ "$HAS_TTY" == "1" ]]; then
+    # 交互式选择模式
+    mode="$(printf "cp (Custom Proxy)\nofficial (Anthropic Official)\n" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Select Mode" --prompt="cld> " | awk '{print $1}')"
+    [[ -z "$mode" ]] && return 0
+  else
+    mode="${CLD_DEFAULT_MODE:-cp}"
+    echo "ℹ️ No TTY detected, auto mode: $mode"
+  fi
 fi
 
 mkdir -p "$CACHE_DIR/$mode" >/dev/null 2>&1 || true
 local -a envs=()
+local goto_exec=""
 
 # 清理代理和认证变量，防止模式间污染
 envs+=(
   "HTTP_PROXY=" "HTTPS_PROXY=" "ALL_PROXY="
   "ANTHROPIC_AUTH_TOKEN="
+  "ANTHROPIC_API_KEY="
 )
 
 # 2. 模式逻辑
@@ -99,9 +231,14 @@ case "$mode" in
     local cp_dir="$CACHE_DIR/cp"
     mkdir -p "$cp_dir" >/dev/null 2>&1 || true
 
+    if ! _healthcheck_proxy_base "$PROXY_BASE"; then
+      _die "无法连接 cliProxyAPI: ${PROXY_BASE} (检查 8145 端口和 PM2 进程)"
+      return 1
+    fi
+
     # 获取模型列表 (从 TOML 实时解析)
     local avail_models="$(_get_proxy_models)"
-    [[ -z "$avail_models" ]] && _die "无法从 TOML 获取模型列表"
+    [[ -z "$avail_models" ]] && { _die "无法从 TOML 获取模型列表"; return 1; }
 
     # 定义角色和默认记忆文件
     local -A roles=(
@@ -139,21 +276,60 @@ case "$mode" in
 
         # 注入其他基础变量
         envs+=(
-          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
           "ANTHROPIC_API_KEY=$PROXY_KEY"
           "CLAUDE_CONFIG_DIR=$cp_dir"
         )
+        _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
         # 跳过交互
         goto_exec=true
       fi
     fi
 
+    if [[ "$goto_exec" != "true" && "$HAS_TTY" != "1" ]]; then
+      local default_main="${CLD_CP_MAIN_DEFAULT:-g3f}"
+      local default_fast="${CLD_CP_FAST_DEFAULT:-$default_main}"
+      local default_opus="${CLD_CP_OPUS_DEFAULT:-opus4.6}"
+
+      local main_model="$default_main"
+      local fast_model="$default_fast"
+      local opus_model="$default_opus"
+
+      [[ -f "$cp_dir/last_main" ]] && main_model="$(cat "$cp_dir/last_main")"
+      [[ -f "$cp_dir/last_fast" ]] && fast_model="$(cat "$cp_dir/last_fast")"
+      [[ -f "$cp_dir/last_opus" ]] && opus_model="$(cat "$cp_dir/last_opus")"
+
+      if ! echo "$avail_models" | grep -q "^${main_model}$"; then
+        main_model="$(echo "$avail_models" | head -1)"
+      fi
+      if ! echo "$avail_models" | grep -q "^${fast_model}$"; then
+        fast_model="$main_model"
+      fi
+      if ! echo "$avail_models" | grep -q "^${opus_model}$"; then
+        opus_model="$main_model"
+      fi
+
+      echo "📦 Non-interactive: Main=$main_model  Fast=$fast_model  Opus=$opus_model"
+      envs+=( "${roles[main]}=$main_model" "${roles[fast]}=$fast_model" "${roles[opus]}=$opus_model" )
+      envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$fast_model" )
+
+      echo "$main_model" > "$cp_dir/last_main"
+      echo "$fast_model" > "$cp_dir/last_fast"
+      echo "$opus_model" > "$cp_dir/last_opus"
+
+      envs+=(
+        "ANTHROPIC_API_KEY=$PROXY_KEY"
+        "CLAUDE_CONFIG_DIR=$cp_dir"
+      )
+      _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
+      goto_exec=true
+    fi
+
     # ── 场景预设选择 ──
     if [[ "$goto_exec" != "true" ]]; then
-      local -A scenario_main=( [Performance]=opus4.6  [Balanced]=g3f      [Economy]=g3f )
-      local -A scenario_fast=( [Performance]=g3f      [Balanced]=g3f      [Economy]=g3f )
-      local -A scenario_opus=( [Performance]=opus4.6  [Balanced]=opus4.6  [Economy]=g3p )
-      local -a scenario_names=( Performance Balanced Economy Custom )
+      local -A scenario_main=( [Performance]=opus4.6  [Balanced]=g3f      [Economy]=g3f  [Auto]=auto )
+      local -A scenario_fast=( [Performance]=g3f      [Balanced]=g3f      [Economy]=g3f  [Auto]=auto )
+      local -A scenario_opus=( [Performance]=opus4.6  [Balanced]=sonnet4.6  [Economy]=g3p  [Auto]=sonnet4.6 )
+      local -a scenario_names=( Auto Performance Balanced Economy Custom )
 
       local last_scenario_file="$cp_dir/last_scenario"
       local last_scenario=""
@@ -191,40 +367,11 @@ case "$mode" in
       echo "$chosen_scenario" > "$last_scenario_file"
 
       if [[ "$chosen_scenario" != "Custom" ]]; then
-        local auto_upgrade_file="$cp_dir/last_auto_upgrade"
-        local last_auto_upgrade="Off"
-        [[ -f "$auto_upgrade_file" ]] && last_auto_upgrade="$(cat "$auto_upgrade_file")"
-        [[ "$last_auto_upgrade" != "On" ]] && last_auto_upgrade="Off"
-
-        local auto_upgrade_choice=""
-        local auto_upgrade_list=""
-        if [[ "$last_auto_upgrade" == "On" ]]; then
-          auto_upgrade_list=$'On\nOff\n'
-        else
-          auto_upgrade_list=$'Off\nOn\n'
-        fi
-
-        auto_upgrade_choice=$(echo "$auto_upgrade_list" | sed '/^$/d' | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Auto Upgrade (g3f.auto→opus4.6)" --prompt="Auto Upgrade (Last: $last_auto_upgrade)> ")
-        if [[ -z "$auto_upgrade_choice" ]]; then
-          auto_upgrade_choice="$last_auto_upgrade"
-          echo "   Using last auto-upgrade: $auto_upgrade_choice"
-        fi
-        echo "$auto_upgrade_choice" > "$auto_upgrade_file"
-
         local s_main="${scenario_main[$chosen_scenario]}"
         local s_fast="${scenario_fast[$chosen_scenario]}"
         local s_opus="${scenario_opus[$chosen_scenario]}"
 
-        if [[ "$auto_upgrade_choice" == "On" && ( "$s_main" == "g3f" || "$s_main" == "g3p" ) ]]; then
-          local auto_model="${s_main}.auto"
-          if echo "$avail_models" | grep -q "^${auto_model}$"; then
-            s_main="$auto_model"
-          else
-            echo "   Auto-upgrade model '$auto_model' not found, fallback to $s_main"
-          fi
-        fi
-
-        echo "📦 Scenario: $chosen_scenario (AutoUpgrade=$auto_upgrade_choice) → Main=$s_main  Fast=$s_fast  Opus=$s_opus"
+        echo "📦 Scenario: $chosen_scenario → Main=$s_main  Fast=$s_fast  Opus=$s_opus"
 
         envs+=( "${roles[main]}=$s_main" "${roles[fast]}=$s_fast" "${roles[opus]}=$s_opus" )
         envs+=( "CLAUDE_CODE_SUBAGENT_MODEL=$s_fast" )
@@ -235,10 +382,10 @@ case "$mode" in
         echo "$s_opus" > "$cp_dir/last_opus"
 
         envs+=(
-          "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
           "ANTHROPIC_API_KEY=$PROXY_KEY"
           "CLAUDE_CONFIG_DIR=$cp_dir"
         )
+        _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
         goto_exec=true
       fi
     fi
@@ -289,37 +436,25 @@ case "$mode" in
 
       # 注入基础变量
       envs+=(
-        "ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")"
         "ANTHROPIC_API_KEY=$PROXY_KEY"
         "CLAUDE_CONFIG_DIR=$cp_dir"
       )
+      _would_use_base_url && envs+=("ANTHROPIC_BASE_URL=$(_norm_base "$PROXY_BASE")")
+    fi
+
+    # 4. Yolo Mode Interactive Selection
+    if [[ "$YOLO_MODE" == "0" && "$HAS_TTY" == "1" && "$goto_exec" != "true" ]]; then
+       local yolo_choice
+       yolo_choice=$(printf "No (Safe)\nYes (Yolo - Skip Permissions)" | fzf --height="$UI_FZF_HEIGHT" --layout=reverse --border --header="Enable Yolo Mode?" --prompt="cld> " | awk '{print $1}')
+       if [[ "$yolo_choice" == "Yes" ]]; then
+         YOLO_MODE="1"
+       fi
     fi
 
     # 提取 Main 模型名用于标题
     local main_model="${envs[(r)ANTHROPIC_MODEL=*]}"
     main_model="${main_model#*=}"
     title="cld:cp:$(_short_model "$main_model")"
-    ;;
-
-  ag)
-    [[ -z "$AG_KEY" ]] && { _die "Missing ANTI_API_TOKEN"; return 1; }
-    echo "🚀 Mode: Antigravity Direct"
-    mkdir -p "$CACHE_DIR/ag" >/dev/null 2>&1 || true
-
-    envs+=(
-      "ANTHROPIC_BASE_URL=$(_norm_base "$AG_BASE")"
-      "ANTHROPIC_API_KEY=$AG_KEY"
-      "ANTHROPIC_MODEL=$AG_CODE_MODEL"
-      "ANTHROPIC_DEFAULT_SONNET_MODEL=$AG_CODE_MODEL"
-      "ANTHROPIC_DEFAULT_OPUS_MODEL=$AG_DOC_MODEL"
-      "ANTHROPIC_DEFAULT_HAIKU_MODEL=$AG_FAST_MODEL"
-      "CLAUDE_CODE_SUBAGENT_MODEL=haiku"
-      "CLAUDE_CONFIG_DIR=$CACHE_DIR/ag"
-    )
-    title="cld:ag:${AG_CODE_MODEL}"
-    echo "   Code=$AG_CODE_MODEL"
-    echo "   Doc =$AG_DOC_MODEL"
-    echo "   Fast=$AG_FAST_MODEL"
     ;;
 
   official)
@@ -333,5 +468,27 @@ esac
 
 _set_title "$title"
 
+# 无 TTY 时，若未传任何 Claude 参数，会陷入“看起来卡住”
+if [[ "$HAS_TTY" != "1" && "$#" -eq 0 ]]; then
+  _die "当前无交互 TTY，无法进入 Claude 交互界面。请使用: ssh -tt <host> cld cp g3f  或  cld cp g3f -p '你的问题'"
+  return 2
+fi
+
 # 执行 Claude，并透传剩余参数
-env "${envs[@]}" claude "$@"
+local tty_dev=""
+if [[ "$HAS_TTY" == "1" ]]; then
+  tty_dev="$(tty 2>/dev/null || true)"
+fi
+
+local -a extra_args=()
+if [[ "$YOLO_MODE" == "1" ]]; then
+  echo "🔥 Yolo Mode Enabled: Skipping Permissions"
+  extra_args+=("--dangerously-skip-permissions")
+fi
+
+echo "▶ Launching claude..."
+if [[ "$HAS_TTY" == "1" && "$tty_dev" == /dev/* ]]; then
+  env "${envs[@]}" "$CLAUDE_CMD" "${extra_args[@]}" "$@" <"$tty_dev" >"$tty_dev" 2>&1
+else
+  env "${envs[@]}" "$CLAUDE_CMD" "${extra_args[@]}" "$@"
+fi

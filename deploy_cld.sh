@@ -15,7 +15,18 @@ fi
 
 # 如果有 providers.toml，从中提取模型列表并烘焙到 cld
 if [[ -f "$TOML_FILE" ]]; then
-  models=$(sed -n '/^\[routing\]/,/^\[.*\]/p' "$TOML_FILE" | grep '^[[:space:]]*"' | cut -d'"' -f2)
+  models=$(awk '
+    /^\[routing\][[:space:]]*$/ { in_routing = 1; next }
+    /^\[[^]]+\][[:space:]]*$/ {
+      if (in_routing) exit
+    }
+    in_routing && $0 ~ /^[[:space:]]*"/ {
+      line = $0
+      sub(/^[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+    }
+  ' "$TOML_FILE")
   if [[ -n "$models" ]]; then
     # 用 python 做文本替换（跨平台可靠）
     python3 -c "

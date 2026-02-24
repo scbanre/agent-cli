@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+"/Volumes/ext/env/scripts/validate_agent_docs.sh"
