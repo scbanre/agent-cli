@@ -1,0 +1,48 @@
+=== REQUEST INFO ===
+Version: dev
+URL: /v1/messages?beta=true
+Method: POST
+Timestamp: 2026-02-17T10:47:05.570503+08:00
+
+=== HEADERS ===
+Accept-Encoding: gzip, deflate
+X-Stainless-Runtime-Version: v25.6.1
+X-Forwarded-Proto: http
+Connection: close
+Anthropic-Version: 2023-06-01
+X-Forwarded-For: ::ffff:127.0.0.1
+Anthropic-Beta: claude-code-20250219,interleaved-thinking-2025-05-14,prompt-caching-scope-2026-01-05
+X-Stainless-Runtime: node
+X-Stainless-Retry-Count: 0
+X-Stainless-Package-Version: 0.74.0
+X-Stainless-Timeout: 600
+User-Agent: claude-cli/2.1.44 (external, cli)
+X-Forwarded-Host: 127.0.0.1:8145
+X-Stainless-Arch: arm64
+Sec-Fetch-Mode: cors
+Anthropic-Dangerous-Direct-Browser-Access: true
+Authorization: Be...er
+X-Stainless-Lang: js
+Accept-Language: *
+X-Stainless-Os: MacOS
+Content-Length: 1066
+X-App: cli
+Accept: application/json
+Content-Type: application/json
+X-Forwarded-Port: 8145
+
+=== REQUEST BODY ===
+{"model":"MiniMax-M2.5","messages":[{"role":"user","content":[{"type":"text","text":"继续"}]}],"system":[{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.44.242; cc_entrypoint=cli; cch=00000;"},{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"Analyze if this message indicates a new conversation topic. If it does, extract a 2-3 word title that captures the new topic. Format your response as a JSON object with two fields: 'isNewTopic' (boolean) and 'title' (string, or null if isNewTopic is false)."}],"tools":[],"metadata":{"user_id":"user_3cf5a42312164c9075a43470e8d78afc1b5fbd58a0415ac32b558f981ebd6fc5_account_96f8278a-410e-418a-aaf5-6bfcb1b9d644_session_e1c498f6-0169-4199-ac0b-463f3eb632e7"},"max_tokens":32000,"temperature":1,"output_config":{"format":{"type":"json_schema","schema":{"type":"object","properties":{"isNewTopic":{"type":"boolean"},"title":{"anyOf":[{"type":"string"},{"type":"null"}]}},"required":["isNewTopic","title"],"additionalProperties":false}}},"stream":true}
+
+=== API RESPONSE ===
+Timestamp: 2026-02-17T10:47:05.5707+08:00
+{"error":{"message":"auth_unavailable: no auth available","type":"server_error","code":"internal_server_error"}}
+
+=== RESPONSE ===
+Status: 500
+Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS
+Access-Control-Allow-Headers: *
+Content-Type: application/json
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"auth_unavailable: no auth available","type":"server_error","code":"internal_server_error"}}

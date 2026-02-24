@@ -1417,6 +1417,10 @@ function cloneRequestPayloadForTarget(req, target) {{
         payload.model = rewrittenModel;
     }}
     applyTargetParamsToPayload(payload, target);
+    // Strip unsupported fields for MiniMax (Anthropic-specific params)
+    if (target?.provider === 'minimax') {{
+        delete payload.metadata;
+    }}
     return Buffer.from(JSON.stringify(payload));
 }}
 

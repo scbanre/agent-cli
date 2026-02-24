@@ -199,8 +199,11 @@ def _add(bucket: dict, rec: dict) -> None:
         new_tokens = (usage.get("input_tokens") or 0)
         new_tokens += (usage.get("cache_creation_input_tokens") or 0)
         cache_read = (usage.get("cache_read_input_tokens") or 0)
-        # OpenAI / Gemini style
+        # OpenAI / Gemini / MiniMax style
         new_tokens += (usage.get("prompt_tokens") or 0)
+        # MiniMax / OpenAI style: prompt_tokens_details.cached_tokens
+        ptd = usage.get("prompt_tokens_details") or {}
+        cache_read += (ptd.get("cached_tokens") or 0)
 
         # Total input tokens (for display)
         bucket["input_tokens"] += new_tokens + cache_read
