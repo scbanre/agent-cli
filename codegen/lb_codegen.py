@@ -1106,6 +1106,28 @@ function parseErrorSummary(contentType, body) {{
     return segments.join(' ').toLowerCase();
 }}
 
+function isReasoningEffortUnsupportedError(statusCode, summary) {{
+    if (!(statusCode === 400 || statusCode === 422)) return false;
+    if (typeof summary !== 'string' || summary.length === 0) return false;
+    const mentionsReasoning = summary.includes('reasoning_effort') ||
+        summary.includes('reasoning effort') ||
+        (summary.includes('reasoning') && summary.includes('effort')) ||
+        summary.includes('xhigh');
+    if (!mentionsReasoning) return false;
+    const unsupportedSignals = [
+        'unsupported',
+        'invalid',
+        'must be',
+        'one of',
+        'allowed',
+        'not support',
+        'unknown',
+        'unrecognized',
+        'not accepted'
+    ];
+    return unsupportedSignals.some((signal) => summary.includes(signal));
+}}
+
 function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {{
     if (statusCode >= 200 && statusCode < 300) {{
         return {{ kind: 'success', clearSticky: false, cooldownMs: 0 }};
@@ -1140,6 +1162,11 @@ function classifyResponse(statusCode, contentType, body, hasThinkingSignature) {
         (statusCode === 400 || statusCode === 422 || statusCode === 500);
     if (isSignatureError) {{
         return {{ kind: 'signature', clearSticky: true, cooldownMs: SIGNATURE_COOLDOWN_MS }};
+    }}
+
+    const isReasoningFallback = isReasoningEffortUnsupportedError(statusCode, summary);
+    if (isReasoningFallback) {{
+        return {{ kind: 'reasoning_fallback', clearSticky: false, cooldownMs: 0 }};
     }}
 
     if ([408, 429, 500, 502, 503, 504].includes(statusCode)) {{
@@ -1275,6 +1302,36 @@ function toPositiveInt(value) {{
     return asInt > 0 ? asInt : null;
 }}
 
+function normalizeReasoningEffort(value) {{
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim().toLowerCase();
+    return normalized || null;
+}}
+
+function getConfiguredReasoningEffort(params) {{
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+    const direct = normalizeReasoningEffort(params.reasoning_effort);
+    if (direct) return direct;
+    const nested = params.reasoning;
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {{
+        const nestedEffort = normalizeReasoningEffort(nested.effort);
+        if (nestedEffort) return nestedEffort;
+    }}
+    return null;
+}}
+
+function getConfiguredReasoningFallbackEffort(params, primaryEffort) {{
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+    let fallback = normalizeReasoningEffort(params.reasoning_fallback_effort);
+    const nested = params.reasoning;
+    if (!fallback && nested && typeof nested === 'object' && !Array.isArray(nested)) {{
+        fallback = normalizeReasoningEffort(nested.fallback_effort);
+    }}
+    if (!fallback) return null;
+    if (primaryEffort && fallback === primaryEffort) return null;
+    return fallback;
+}}
+
 function mergeCommaHeader(existingValue, appendValue) {{
     if (typeof appendValue !== 'string' || !appendValue.trim()) return existingValue;
     const existingParts = String(existingValue || '')
@@ -1299,8 +1356,13 @@ function mergeCommaHeader(existingValue, appendValue) {{
 function summarizeTargetParams(params) {{
     if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
     const summary = {{}};
-    if (typeof params.reasoning_effort === 'string' && params.reasoning_effort.trim()) {{
-        summary.reasoning_effort = params.reasoning_effort.trim();
+    const reasoningEffort = getConfiguredReasoningEffort(params);
+    if (reasoningEffort) {{
+        summary.reasoning_effort = reasoningEffort;
+    }}
+    const reasoningFallbackEffort = getConfiguredReasoningFallbackEffort(params, reasoningEffort);
+    if (reasoningFallbackEffort) {{
+        summary.reasoning_fallback_effort = reasoningFallbackEffort;
     }}
     const thinkingBudgetMax = toPositiveInt(params.thinking_budget_max);
     if (thinkingBudgetMax) {{
@@ -1352,12 +1414,29 @@ function applyTargetHeaders(req, target) {{
     }}
 }}
 
-function applyTargetParamsToPayload(payload, target) {{
+function resolveTargetReasoningFallbackEffort(target, req) {{
+    const params = target?.params;
+    if (!params || typeof params !== 'object' || Array.isArray(params)) return null;
+    const currentEffort = normalizeReasoningEffort(req?._reasoningEffortOverride) || getConfiguredReasoningEffort(params);
+    return getConfiguredReasoningFallbackEffort(params, currentEffort);
+}}
+
+function applyTargetParamsToPayload(payload, target, req) {{
     const params = target?.params;
     if (!params || typeof params !== 'object' || Array.isArray(params)) return payload;
 
-    if (typeof params.reasoning_effort === 'string' && params.reasoning_effort.trim()) {{
-        payload.reasoning_effort = params.reasoning_effort.trim();
+    const overrideReasoningEffort = normalizeReasoningEffort(req?._reasoningEffortOverride);
+    const configuredReasoningEffort = getConfiguredReasoningEffort(params);
+    const reasoningEffort = overrideReasoningEffort || configuredReasoningEffort;
+    if (reasoningEffort) {{
+        payload.reasoning_effort = reasoningEffort;
+        const reasoningConfig = payload.reasoning && typeof payload.reasoning === 'object' && !Array.isArray(payload.reasoning)
+            ? payload.reasoning
+            : {{}};
+        payload.reasoning = {{
+            ...reasoningConfig,
+            effort: reasoningEffort
+        }};
     }}
 
     const thinkingBudgetMax = toPositiveInt(params.thinking_budget_max);
@@ -1416,7 +1495,7 @@ function cloneRequestPayloadForTarget(req, target) {{
         }}
         payload.model = rewrittenModel;
     }}
-    applyTargetParamsToPayload(payload, target);
+    applyTargetParamsToPayload(payload, target, req);
     // Strip unsupported fields for MiniMax (Anthropic-specific params)
     if (target?.provider === 'minimax') {{
         delete payload.metadata;
@@ -1541,6 +1620,38 @@ proxy.on('proxyRes', (proxyRes, req, res) => {{
         if (routeAction.cooldownMs > 0 && req._selectedTarget && req._model) {{
             setTargetCooldown(req._model, req._selectedTarget, routeAction.cooldownMs);
             req._cooldownMsApplied = routeAction.cooldownMs;
+        }}
+
+        if (
+            routeAction.kind === 'reasoning_fallback' &&
+            !isSSE &&
+            req.method === 'POST' &&
+            !res.headersSent &&
+            !req._reasoningEffortRetried &&
+            req._selectedTarget
+        ) {{
+            const fallbackEffort = resolveTargetReasoningFallbackEffort(req._selectedTarget, req);
+            if (fallbackEffort) {{
+                req._reasoningEffortRetried = true;
+                req._reasoningEffortOverride = fallbackEffort;
+                if (!Array.isArray(req._retryTrace)) {{
+                    req._retryTrace = [];
+                }}
+                req._retryTrace.push({{
+                    from_instance: req._targetInstance || null,
+                    from_url: req._targetUrl || null,
+                    from_model: req._rewrittenModel || req._model || null,
+                    status_code: proxyRes.statusCode || 0,
+                    route_action: routeAction.kind,
+                    fallback_reasoning_effort: fallbackEffort,
+                    attempt_duration_ms: attemptDuration,
+                    body_preview: responsePreview
+                }});
+                req._retryCount = (req._retryCount || 0) + 1;
+                req._routingDecision = `retry_on_reasoning_fallback_${{fallbackEffort}}`;
+                forwardRequestToTarget(req, res, req._selectedTarget, req._routingDecision);
+                return;
+            }}
         }}
 
         const canRetry = !isSSE &&
@@ -1937,6 +2048,8 @@ const server = http.createServer((req, res) => {{
             req._retryCount = 0;
             req._triedTargets = new Set();
             req._retryTrace = [];
+            req._reasoningEffortOverride = null;
+            req._reasoningEffortRetried = false;
             req._targetParamSummary = null;
             req._autoUpgrade = null;
             req._modelRouter = null;
