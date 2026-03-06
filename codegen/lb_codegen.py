@@ -1421,15 +1421,32 @@ function resolveTargetReasoningFallbackEffort(target, req) {{
     return getConfiguredReasoningFallbackEffort(params, currentEffort);
 }}
 
+function getRequestPathname(req) {{
+    if (!req || typeof req.url !== 'string') return '';
+    const queryIndex = req.url.indexOf('?');
+    if (queryIndex >= 0) {{
+        return req.url.slice(0, queryIndex);
+    }}
+    return req.url;
+}}
+
+function isResponsesApiRequest(req) {{
+    const pathname = getRequestPathname(req);
+    return pathname === '/v1/responses' || pathname.startsWith('/v1/responses/');
+}}
+
 function applyTargetParamsToPayload(payload, target, req) {{
     const params = target?.params;
     if (!params || typeof params !== 'object' || Array.isArray(params)) return payload;
+    const isResponsesApi = isResponsesApiRequest(req);
 
     const overrideReasoningEffort = normalizeReasoningEffort(req?._reasoningEffortOverride);
     const configuredReasoningEffort = getConfiguredReasoningEffort(params);
     const reasoningEffort = overrideReasoningEffort || configuredReasoningEffort;
     if (reasoningEffort) {{
-        payload.reasoning_effort = reasoningEffort;
+        if (!isResponsesApi) {{
+            payload.reasoning_effort = reasoningEffort;
+        }}
         const reasoningConfig = payload.reasoning && typeof payload.reasoning === 'object' && !Array.isArray(payload.reasoning)
             ? payload.reasoning
             : {{}};
@@ -1437,6 +1454,9 @@ function applyTargetParamsToPayload(payload, target, req) {{
             ...reasoningConfig,
             effort: reasoningEffort
         }};
+    }}
+    if (isResponsesApi && Object.prototype.hasOwnProperty.call(payload, 'reasoning_effort')) {{
+        delete payload.reasoning_effort;
     }}
 
     const thinkingBudgetMax = toPositiveInt(params.thinking_budget_max);
